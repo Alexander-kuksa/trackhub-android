@@ -38,6 +38,9 @@ import java.util.concurrent.Executors
  */
 object TrackHub {
 
+    /** SDK version reported to the platform for integration detection. */
+    const val SDK_VERSION = "1.0.0"
+
     private const val PREFS = "trackhub"
     private const val INSTALL_SENT_KEY = "install_sent"
     private val io = Executors.newSingleThreadExecutor()
@@ -106,6 +109,9 @@ object TrackHub {
         val body = JSONObject()
             .put("user_id", uid)
             .put("platform", "android")
+            // sdk_* fields inside the signed body so the HMAC authenticates them
+            .put("sdk_name", "trackhub-android")
+            .put("sdk_version", SDK_VERSION)
             .put("os_version", Build.VERSION.RELEASE ?: "")
             .put("occurred_at", iso8601(Date()))
         appVersion(context)?.let { body.put("app_version", it) }
