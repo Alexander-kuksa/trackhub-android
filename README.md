@@ -4,13 +4,21 @@ Kotlin SDK for TrackHub: reports the install with **Google Play Install Referrer
 and an optional **SDK Signature** (HMAC) — the Android counterpart of the iOS SDK. Same security
 model: HTTPS enforced, token/secret in memory only and never logged, install reports HMAC-signed.
 
-> **Build status — honest note.** This module is written to production quality and mirrors the
-> reviewed iOS SDK, but it was **not compiled or instrumented on this machine** (no Android /
-> Gradle toolchain was available here). Open it in Android Studio (or run `gradle wrapper &&
-> ./gradlew :trackhub:test :trackhub:assembleRelease`) and run it on a device/emulator before
-> publishing. The one security-critical piece — the HMAC signature — is pinned to a shared
-> parity vector (`SigningTest`) that already matches the server and the iOS SDK byte-for-byte,
-> so a green `:trackhub:test` confirms signing interop.
+> **Build status.** GitHub Actions (`.github/workflows/android-ci.yml`) compiles the library
+> (`:trackhub:assembleRelease`) and runs the unit tests (`:trackhub:test`) on every push and PR,
+> so a green check confirms it **compiles** and that the HMAC signature matches the shared parity
+> vector (`SigningTest`) byte-for-byte with the server and the iOS SDK. What CI does **not** cover
+> is on-device/emulator behaviour (the Play Install Referrer handshake) — there are no
+> instrumented tests yet, so smoke-test on a real device/emulator before publishing.
+
+## Building & testing
+
+```bash
+# CI provisions Gradle 8.7 (this repo ships without a committed wrapper binary).
+# Locally, install JDK 17 + Gradle 8.7 (or open in Android Studio), then:
+gradle :trackhub:test            # unit tests, incl. the signature parity vector
+gradle :trackhub:assembleRelease # build the release AAR
+```
 
 ## Why Android differs from iOS
 
