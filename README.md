@@ -22,13 +22,26 @@ the binary.
 
 ## Install
 
+Repository: `https://github.com/Alexander-kuksa/trackhub-android`. The simplest way to consume a
+public GitHub Android library is **JitPack** (builds from a release tag — no manual artifact
+publishing):
+
 ```kotlin
-// settings.gradle.kts (consumer app) — once published to your Maven/GitHub Packages:
-dependencyResolutionManagement { repositories { /* your maven repo */ } }
+// settings.gradle.kts (consumer app)
+dependencyResolutionManagement {
+    repositories {
+        google()
+        mavenCentral()
+        maven { url = uri("https://jitpack.io") }
+    }
+}
 
 // app/build.gradle.kts
-implementation("com.trackhub:trackhub-android:1.0.0")
+implementation("com.github.Alexander-kuksa:trackhub-android:1.0.0")
 ```
+
+(Requires a `1.0.0` git tag on the repo. Alternatively publish to GitHub Packages with
+`./gradlew :trackhub:publish` and consume `com.trackhub:trackhub-android:1.0.0`.)
 
 The Play Install Referrer Library is pulled in transitively.
 
