@@ -55,6 +55,18 @@ implementation("com.github.Alexander-kuksa:trackhub-android:1.5.0")
 
 The Play Install Referrer Library is pulled in transitively.
 
+Advertising ID support is deliberately opt-in so apps that do not use it do
+not inherit the `AD_ID` permission. If `collectAdvertisingId = true`, add the
+Google Play services identifier runtime to the host app as well:
+
+```kotlin
+implementation("com.google.android.gms:play-services-ads-identifier:18.2.0")
+```
+
+Keep `collectAdvertisingId = false` unless `ad_user_data` consent is available.
+The SDK also checks that persisted consent before reading GAID. Version 18.2.0
+preserves TrackHub's Android 5.0 / API 21 floor; Google 18.3.0 requires API 23.
+
 ## Usage
 
 ```kotlin

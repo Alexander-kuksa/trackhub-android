@@ -31,9 +31,11 @@ android {
 dependencies {
     // Official Google Play Install Referrer Library (attribution source)
     implementation("com.android.installreferrer:installreferrer:2.2")
-    // Optional at runtime: TrackHub reads GAID only when the host explicitly
-    // enables collection and grants ad_user_data consent.
-    implementation("com.google.android.gms:play-services-ads-identifier:18.3.0")
+    // Optional at runtime: do not force AD_ID permission or a minSdk increase
+    // on every consumer. Hosts that explicitly enable GAID collection add the
+    // runtime dependency themselves (documented in README). 18.2.0 is the
+    // official Google artifact whose manifest still supports minSdk 21.
+    compileOnly("com.google.android.gms:play-services-ads-identifier:18.2.0")
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:core:1.6.1")
