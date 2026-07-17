@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Test-only: MockWebServer runs inside the emulator on localhost. The
+         published library manifest still requires HTTPS for real endpoints. -->
+    <application android:usesCleartextTraffic="true" />
+</manifest>

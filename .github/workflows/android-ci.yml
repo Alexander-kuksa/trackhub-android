@@ -7,6 +7,7 @@ name: Android CI
 on:
   push:
     branches: [main]
+    tags: ['*']
   pull_request:
 
 jobs:
@@ -24,8 +25,12 @@ jobs:
           gradle-version: '8.7'
       # Unit tests first (fast fail on the signature parity vector), then the
       # release AAR to prove the library compiles.
-      - run: gradle :trackhub:test --no-daemon --stacktrace
-      - run: gradle :trackhub:assembleRelease --no-daemon --stacktrace
+      - run: gradle :trackhub:test :trackhub:assembleRelease :trackhub:assembleDebugAndroidTest --no-daemon --stacktrace
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          script: gradle :trackhub:connectedDebugAndroidTest --no-daemon --stacktrace
       - uses: actions/upload-artifact@v4
         if: always()
         with:

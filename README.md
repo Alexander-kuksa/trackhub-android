@@ -1,15 +1,17 @@
 # TrackHub Android SDK
 
-Kotlin SDK for TrackHub: reports the install with **Google Play Install Referrer** attribution
-and an optional **SDK Signature** (HMAC) — the Android counterpart of the iOS SDK. Same security
-model: HTTPS enforced, token/secret in memory only and never logged, install reports HMAC-signed.
+Kotlin SDK for TrackHub: install/referrer attribution, automatic app sessions, custom engagement
+events and the App Conversion purchase bridge. Revenue stays authoritative in Apphud/S2S; the SDK
+never accepts a price or currency.
 
 > **Build status.** GitHub Actions (`.github/workflows/android-ci.yml`) compiles the library
 > (`:trackhub:assembleRelease`) and runs the unit tests (`:trackhub:test`) on every push and PR,
 > so a green check confirms it **compiles** and that the HMAC signature matches the shared parity
 > vector (`SigningTest`) byte-for-byte with the server and the iOS SDK. What CI does **not** cover
-> is on-device/emulator behaviour (the Play Install Referrer handshake) — there are no
-> instrumented tests yet, so smoke-test on a real device/emulator before publishing.
+> is the Play Store service's real production response. CI now compiles and runs an Android
+> instrumentation test on API 34 for signed payloads, Test Lab token isolation, retry/queue drain,
+> and the absence of the Advertising ID permission. Still smoke-test Play Install Referrer on a Play-enabled device
+> before publishing because the emulator cannot reproduce every Play Store state.
 
 ## Building & testing
 
@@ -24,9 +26,9 @@ gradle :trackhub:assembleRelease # build the release AAR
 
 There is no SKAdNetwork and no AdServices token on Android. The acquisition signal is the
 **Google Play Install Referrer**, handed to the app once on first launch. The SDK forwards it to
-TrackHub, which derives the channel (Google Ads / organic) and campaign. Revenue/trials still
-flow server-side via Apphud webhooks — the SDK never sends money, so no second secret ships in
-the binary.
+TrackHub, which derives the channel (Google Ads / organic) and campaign. It also sends non-financial
+engagement events and a transaction-only purchase observation so TrackHub can join the real device
+context to the authoritative Apphud webhook before calling Google.
 
 ## Install
 
@@ -45,11 +47,11 @@ dependencyResolutionManagement {
 }
 
 // app/build.gradle.kts
-implementation("com.github.Alexander-kuksa:trackhub-android:1.0.0")
+implementation("com.github.Alexander-kuksa:trackhub-android:1.5.0")
 ```
 
-(Requires a `1.0.0` git tag on the repo. Alternatively publish to GitHub Packages with
-`./gradlew :trackhub:publish` and consume `com.trackhub:trackhub-android:1.0.0`.)
+(Requires a `1.5.0` git tag on the repo. Alternatively publish to GitHub Packages with
+`./gradlew :trackhub:publish` and consume `com.trackhub:trackhub-android:1.5.0`.)
 
 The Play Install Referrer Library is pulled in transitively.
 
@@ -58,6 +60,21 @@ The Play Install Referrer Library is pulled in transitively.
 ```kotlin
 import com.trackhub.TrackHub
 
+TrackHub.setGoogleAdsConsent(
+    context = applicationContext,
+    adUserData = consent.adUserData,
+    adPersonalization = consent.adPersonalization,
+    eea = consent.isEea
+)
+
+// Mainland China only, after your PIPL consent UI resolves these values:
+// TrackHub.setPiplConsent(
+//     context = applicationContext,
+//     piplConsent = consent.pipl,
+//     crossBorderTransferConsent = consent.crossBorder,
+//     adsMeasurementConsent = consent.adsMeasurement
+// )
+
 // On app launch (Application.onCreate), after Apphud starts.
 // Copy the exact values from the app's page in TrackHub → SDK integration.
 TrackHub.configure(
@@ -65,26 +82,80 @@ TrackHub.configure(
     endpoint = "https://postbacks.daively.com", // your ingest domain
     ingestToken = "<app ingest token>",
     userId = Apphud.userId(),
-    sdkSecret = "<app sdk secret>" // optional; enables SDK Signature
+    sdkSecret = "<app sdk secret>", // required for the purchase bridge
+    collectAdvertisingId = true,   // only with ad_user_data consent
+    apphudCollectDeviceIdentifiersHandler = {
+        Apphud.collectDeviceIdentifiers()
+    },
+    apphudAttributionHandler = { data, completion ->
+        // Adapt `data` to Apphud's custom-attribution API in the host app.
+        sendTrackHubAttributionToApphud(data, completion)
+    },
+    attributionChangedHandler = { attribution ->
+        updateAttributionUi(attribution)
+    },
+    deferredDeepLinkHandler = { path ->
+        path?.let(::routeDeferredPath)
+    }
 )
+
+// In your FirebaseMessagingService. TrackHub does not initialize Firebase or
+// request Android 13 notification permission; it only forwards this host-owned
+// token for a data-only uninstall probe.
+override fun onNewToken(token: String) {
+    TrackHub.setPushToken(applicationContext, token)
+}
+
+// Non-financial engagement events:
+TrackHub.trackEvent("trial_started")
+TrackHub.trackEvent("paywall_viewed", callbackParams = mapOf("placement" to "onboarding"))
+
+// In the successful Play/Apphud purchase callback. No amount is sent here:
+purchase.orderId?.let { orderId ->
+    TrackHub.trackPurchaseObserved(
+        transactionId = orderId,
+        productId = purchase.products.firstOrNull()
+    )
+}
+
+// Forward Google deep-link ids for session reattribution:
+TrackHub.handleDeepLink(intent.data!!)
 ```
 
-That single call reports the install (once) with the referrer and, if `sdkSecret` is set,
-HMAC-signs it. There is no `track()` on Android — conversion values / SKAN are Apple-only, and
-revenue arrives via Apphud webhooks.
+`configure` reports the install once, starts automatic foreground session tracking and flushes the
+bounded offline queue. `sdkSecret` is optional for ordinary measurement but required for
+`trackPurchaseObserved`, because an unsigned bearer-token request must never control an ads
+conversion. `userId` is optional; the SDK creates a persistent app-scoped fallback. Firebase is
+not required. `getAttribution`, `resolveDeferredDeepLink` and `forgetDevice` are also public for
+explicit refresh, routing and privacy-erasure flows.
+
+Uninstall measurement additionally requires an FCM connection linked to the app in TrackHub.
+The SDK persists the latest FCM token and re-sends it after every `configure`; the server counts an
+uninstall only when FCM explicitly returns `UNREGISTERED`, never on a timeout or generic error.
+
+When an SDK event is explicitly mapped to a Google App Conversion custom event, bounded primitive
+`callbackParams` become Google `app_event_data`; `partnerParams` are retained in TrackHub only.
 
 ## Security properties (parity with the iOS SDK, reviewed)
 
 - **HTTPS enforced** — non-HTTPS endpoints are refused (localhost exempt for development).
-- **No secrets at rest / in logs** — the ingest token and SDK secret are held in memory only;
-  only a non-secret `install_sent` flag is persisted. Debug logging prints status, never
-  credentials.
-- **SDK Signature** — `HMAC-SHA256(secret, "<timestamp>.<ingestToken>.<rawBody>")`, lowercase
-  hex, in `X-TrackHub-Timestamp` / `X-TrackHub-Signature`. The server enforces a ±5-minute
-  anti-replay window and constant-time comparison; installs additionally dedup by `(app, user)`.
-- **Minimal data** — user id, OS/app version, and the Play referrer. No IDFA/GAID collection,
-  no device fingerprinting.
-- **Single dependency** — only the official Play Install Referrer Library.
+- **No secrets at rest / in logs** — the ingest token and SDK secret are held in memory only.
+  The bounded offline queue stores report bodies but never credentials; debug logging prints
+  status, never tokens or secrets.
+- **SDK Signature v2** —
+  `HMAC-SHA256(secret, "<timestamp>.<ingestToken>.<endpointScope>.<rawBody>")`, lowercase
+  hex, with signature-version `2`. The server enforces a ±5-minute anti-replay window,
+  endpoint binding and constant-time comparison; secret rotation has a 7-day grace period.
+- **Consent-gated identity** — user id, OS/app version, Play referrer, engagement events and a
+  stable transaction/product id. GAID is collected only when the host opts in and persisted
+  `ad_user_data` consent is true; limited/zero identifiers are discarded. No device
+  fingerprinting. The server encrypts purchase context and deletes it after Apphud join or 72h.
+- **Spec-complete event context** — a stable first-open timestamp and ISO country accompany every
+  event so Google's required `fot` and `ctry_c` survive install/session request races.
+- **PIPL fail-closed support** — `setPiplConsent` persists mainland-China processing,
+  cross-border-transfer and ads-measurement choices for server-side enforcement.
+- **Platform dependencies only** — the official Play Install Referrer and Google Advertising ID
+  clients; Apphud remains a host adapter rather than a hard SDK dependency.
 
 ## Hardening note
 
