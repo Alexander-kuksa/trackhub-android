@@ -41,7 +41,7 @@ class SigningTest {
     @Test
     fun differentEndpointProducesDifferentSignature() {
         val install = Signing.sign("s", "1", "t", "install", "{}")
-        val forget = Signing.sign("s", "1", "t", "sdk/forget-device", "{}")
-        assert(install != forget)
+        val session = Signing.sign("s", "1", "t", "sdk/session", "{}")
+        assert(install != session)
     }
 }

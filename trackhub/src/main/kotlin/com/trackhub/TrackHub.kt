@@ -15,6 +15,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLDecoder
+import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.security.MessageDigest
 import java.util.Date
@@ -40,6 +42,10 @@ typealias TrackHubAttributionChangedHandler = (TrackHubAttribution) -> Unit
 typealias TrackHubDeferredDeepLinkHandler = (String?) -> Unit
 typealias ApphudAttributionHandler = (Map<String, String>, (Boolean) -> Unit) -> Unit
 typealias ApphudCollectDeviceIdentifiersHandler = () -> Unit
+/** Supplies raw TrackHub attribution JSON through the host app's trusted backend. */
+typealias TrackHubBackendAttributionProvider = (String, (String?) -> Unit) -> Unit
+/** Requests TrackHub privacy erasure through the host app's trusted backend. */
+typealias TrackHubBackendPrivacyErasureHandler = (String, String, (Boolean) -> Unit) -> Unit
 
 enum class TrackHubSalesPlacement(val value: String) {
     ONBOARDING("onboarding_placement"),
@@ -99,6 +105,7 @@ object TrackHub {
     private const val PUSH_TOKEN_KEY = "push_token_fcm"
     private const val APPHUD_ATTRIBUTION_REVISION_PREFIX = "apphud_attribution_revision_"
     private const val DEFERRED_RESOLVE_PREFIX = "deferred_resolve_"
+    private const val DEFERRED_MATCH_TOKEN_KEY = "deferred_match_token"
     private const val PRIVACY_DISABLED_PREFIX = "privacy_disabled_"
     private const val AD_USER_DATA_KEY = "consent_ad_user_data"
     private const val AD_PERSONALIZATION_KEY = "consent_ad_personalization"
@@ -122,6 +129,8 @@ object TrackHub {
     @Volatile private var debug = false
     @Volatile private var lifecycleRegistered = false
     @Volatile private var collectAdvertisingId = false
+    @Volatile private var backendAttributionProvider: TrackHubBackendAttributionProvider? = null
+    @Volatile private var backendPrivacyErasureHandler: TrackHubBackendPrivacyErasureHandler? = null
     @Volatile private var apphudAttributionHandler: ApphudAttributionHandler? = null
     @Volatile private var apphudCollectDeviceIdentifiersHandler: ApphudCollectDeviceIdentifiersHandler? = null
     @Volatile private var attributionChangedHandler: TrackHubAttributionChangedHandler? = null
@@ -145,6 +154,8 @@ object TrackHub {
         integrationTestToken: String? = null,
         collectAdvertisingId: Boolean = false,
         apphudCollectDeviceIdentifiersHandler: ApphudCollectDeviceIdentifiersHandler? = null,
+        backendAttributionProvider: TrackHubBackendAttributionProvider? = null,
+        backendPrivacyErasureHandler: TrackHubBackendPrivacyErasureHandler? = null,
         apphudAttributionHandler: ApphudAttributionHandler? = null,
         attributionChangedHandler: TrackHubAttributionChangedHandler? = null,
         deferredDeepLinkHandler: TrackHubDeferredDeepLinkHandler? = null,
@@ -166,6 +177,8 @@ object TrackHub {
         this.integrationTestToken = integrationTestToken?.trim()?.takeIf { it.length in 20..128 }
         this.collectAdvertisingId = collectAdvertisingId
         this.apphudCollectDeviceIdentifiersHandler = apphudCollectDeviceIdentifiersHandler
+        this.backendAttributionProvider = backendAttributionProvider
+        this.backendPrivacyErasureHandler = backendPrivacyErasureHandler
         this.apphudAttributionHandler = apphudAttributionHandler
         this.attributionChangedHandler = attributionChangedHandler
         this.deferredDeepLinkHandler = deferredDeepLinkHandler
@@ -292,7 +305,10 @@ object TrackHub {
         io.execute { resolveDeferredDeepLinkIfNeeded(completion) }
     }
 
-    /** Erases the app/user identity and disables subsequent SDK delivery. */
+    /**
+     * Erases the app/user identity through the host app's trusted backend and
+     * disables SDK delivery only after that backend confirms acceptance.
+     */
     @JvmStatic
     @JvmOverloads
     fun forgetDevice(reason: String = "user_requested", completion: ((Boolean) -> Unit)? = null) {
@@ -300,26 +316,29 @@ object TrackHub {
             val context = appContext
             val uid = userId
             val token = ingestToken
-            if (context == null || uid.isNullOrBlank() || token == null || sdkSecret.isNullOrBlank()) {
+            val handler = backendPrivacyErasureHandler
+            if (context == null || uid.isNullOrBlank() || token == null || handler == null) {
+                log("forget-device requires backendPrivacyErasureHandler")
                 completion?.let { callback -> runOnMain { callback(false) } }
                 return@execute
             }
-            val body = JSONObject()
-                .put("user_id", uid)
-                .put("reason", reason.take(256))
-                .toString()
-            val accepted = postForResponse("sdk/forget-device", body).first in 200..299
-            if (accepted) {
-                trackingDisabled = true
-                currentAttribution = null
-                val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                prefs.edit()
-                    .putBoolean(PRIVACY_DISABLED_PREFIX + hashKey(token), true)
-                    .remove(pendingReportsKey())
-                    .remove(PUSH_TOKEN_KEY)
-                    .apply()
+            runOnMain {
+                handler(uid, reason.take(256)) { accepted ->
+                    io.execute {
+                        if (accepted) {
+                            trackingDisabled = true
+                            currentAttribution = null
+                            val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                            prefs.edit()
+                                .putBoolean(PRIVACY_DISABLED_PREFIX + hashKey(token), true)
+                                .remove(pendingReportsKey())
+                                .remove(PUSH_TOKEN_KEY)
+                                .apply()
+                        }
+                        completion?.let { callback -> runOnMain { callback(accepted) } }
+                    }
+                }
             }
-            completion?.let { callback -> runOnMain { callback(accepted) } }
         }
     }
 
@@ -474,6 +493,9 @@ object TrackHub {
 
     private fun sendInstall(context: Context, prefs: android.content.SharedPreferences, referrer: String?) {
         val uid = userId ?: return
+        deferredMatchToken(referrer)?.let { matchToken ->
+            prefs.edit().putString(DEFERRED_MATCH_TOKEN_KEY, matchToken).apply()
+        }
         val body = JSONObject()
             .put("user_id", uid)
             .put("install_uid", installUid(context))
@@ -504,6 +526,22 @@ object TrackHub {
         } else {
             log("install report failed — will retry on next launch")
         }
+        if (integrationTestToken == null) resolveDeferredDeepLinkIfNeeded()
+    }
+
+    internal fun deferredMatchToken(referrer: String?): String? {
+        if (referrer.isNullOrBlank()) return null
+        return referrer.split('&').asSequence().mapNotNull { pair ->
+            runCatching {
+                val separator = pair.indexOf('=')
+                val rawKey = if (separator >= 0) pair.substring(0, separator) else pair
+                if (URLDecoder.decode(rawKey, Charsets.UTF_8.name()) != "trackhub_match_token") {
+                    return@runCatching null
+                }
+                val rawValue = if (separator >= 0) pair.substring(separator + 1) else ""
+                URLDecoder.decode(rawValue, Charsets.UTF_8.name()).takeIf { it.length in 1..128 }
+            }.getOrNull()
+        }.firstOrNull()
     }
 
     private fun appendConsent(prefs: android.content.SharedPreferences, body: JSONObject) {
@@ -581,22 +619,28 @@ object TrackHub {
             return
         }
         val uid = userId
-        if (uid.isNullOrBlank() || sdkSecret.isNullOrBlank()) {
+        val provider = backendAttributionProvider
+        if (uid.isNullOrBlank() || provider == null) {
             completion?.let { callback -> runOnMain { callback(null) } }
+            if (provider == null) log("attribution fetch requires backendAttributionProvider")
             return
         }
         attributionFetchInFlight = true
-        val body = JSONObject().put("user_id", uid).put("event_at", iso8601(Date())).toString()
-        val (code, raw) = postForResponse("sdk/attribution", body)
-        attributionFetchInFlight = false
-        val snapshot = if (code in 200..299 && raw != null) parseAttribution(raw) else null
-        if (snapshot != null) {
-            val changed = currentAttribution?.revision != snapshot.revision
-            currentAttribution = snapshot
-            if (changed) attributionChangedHandler?.let { handler -> runOnMain { handler(snapshot) } }
-            deliverAttributionToApphud(uid, snapshot)
+        runOnMain {
+            provider(uid) { raw ->
+                io.execute {
+                    attributionFetchInFlight = false
+                    val snapshot = raw?.let(::parseAttribution)
+                    if (snapshot != null) {
+                        val changed = currentAttribution?.revision != snapshot.revision
+                        currentAttribution = snapshot
+                        if (changed) attributionChangedHandler?.let { handler -> runOnMain { handler(snapshot) } }
+                        deliverAttributionToApphud(uid, snapshot)
+                    }
+                    completion?.let { callback -> runOnMain { callback(snapshot) } }
+                }
+            }
         }
-        completion?.let { callback -> runOnMain { callback(snapshot) } }
     }
 
     private fun parseAttribution(raw: String): TrackHubAttribution? = runCatching {
@@ -655,15 +699,21 @@ object TrackHub {
             if (completion != null) runOnMain { handler(null) }
             return
         }
+        val matchToken = prefs.getString(DEFERRED_MATCH_TOKEN_KEY, null)
+        if (matchToken.isNullOrBlank()) {
+            if (completion != null) runOnMain { handler(null) }
+            return
+        }
         deferredResolveInFlight = true
-        val (code, raw) = getForResponse("resolve")
+        val encodedToken = URLEncoder.encode(matchToken, Charsets.UTF_8.name())
+        val (code, raw) = getForResponse("resolve?match_token=$encodedToken")
         deferredResolveInFlight = false
         if (code !in 200..299 || raw == null) {
             runOnMain { handler(null) }
             return
         }
         val path = runCatching { JSONObject(raw).optString("deep_link_path").takeIf { it.isNotEmpty() } }.getOrNull()
-        prefs.edit().putBoolean(key, true).apply()
+        prefs.edit().putBoolean(key, true).remove(DEFERRED_MATCH_TOKEN_KEY).apply()
         runOnMain { handler(path) }
     }
 

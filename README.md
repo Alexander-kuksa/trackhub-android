@@ -88,7 +88,8 @@ TrackHub.setGoogleAdsConsent(
 // )
 
 // On app launch (Application.onCreate), after Apphud starts.
-// Copy the exact values from the app's page in TrackHub → SDK integration.
+// Copy the app values from TrackHub → SDK integration. AppBackend below is
+// your authenticated API; it keeps the TrackHub S2S secret off the device.
 TrackHub.configure(
     context = applicationContext,
     endpoint = "https://postbacks.daively.com", // your ingest domain
@@ -98,6 +99,12 @@ TrackHub.configure(
     collectAdvertisingId = true,   // only with ad_user_data consent
     apphudCollectDeviceIdentifiersHandler = {
         Apphud.collectDeviceIdentifiers()
+    },
+    backendAttributionProvider = { userId, completion ->
+        AppBackend.fetchTrackHubAttribution(userId, completion)
+    },
+    backendPrivacyErasureHandler = { userId, reason, completion ->
+        AppBackend.eraseTrackHubUser(userId, reason, completion)
     },
     apphudAttributionHandler = { data, completion ->
         // Adapt `data` to Apphud's custom-attribution API in the host app.
@@ -139,7 +146,14 @@ bounded offline queue. `sdkSecret` is optional for ordinary measurement but requ
 `trackPurchaseObserved`, because an unsigned bearer-token request must never control an ads
 conversion. `userId` is optional; the SDK creates a persistent app-scoped fallback. Firebase is
 not required. `getAttribution`, `resolveDeferredDeepLink` and `forgetDevice` are also public for
-explicit refresh, routing and privacy-erasure flows.
+explicit refresh, routing and privacy-erasure flows. Attribution and erasure fail closed unless
+the corresponding `AppBackend` callback is supplied. That backend authenticates the signed-in
+user, calls TrackHub with a linked S2S connection's `X-TrackHub-Token`, and returns only the raw
+attribution response or success flag; the S2S token must never reach the app.
+
+TrackHub-owned Google Play links add an opaque `trackhub_match_token` to Install Referrer. The SDK
+returns that token once to `/resolve`, consumes it after a successful response and never uses IP or
+User-Agent matching to retrieve a private deferred path.
 
 Uninstall measurement additionally requires an FCM connection linked to the app in TrackHub.
 The SDK persists the latest FCM token and re-sends it after every `configure`; the server counts an
@@ -158,6 +172,9 @@ When an SDK event is explicitly mapped to a Google App Conversion custom event, 
   `HMAC-SHA256(secret, "<timestamp>.<ingestToken>.<endpointScope>.<rawBody>")`, lowercase
   hex, with signature-version `2`. The server enforces a ±5-minute anti-replay window,
   endpoint binding and constant-time comparison; secret rotation has a 7-day grace period.
+- **Backend-only sensitive operations** — the app-wide SDK secret cannot read another user's
+  attribution or erase an arbitrary identity. The host backend authorizes those operations with
+  its S2S secret and returns only the scoped result to the SDK.
 - **Consent-gated identity** — user id, OS/app version, Play referrer, engagement events and a
   stable transaction/product id. GAID is collected only when the host opts in and persisted
   `ad_user_data` consent is true; limited/zero identifiers are discarded. No device
