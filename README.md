@@ -61,11 +61,16 @@ Google Play services identifier runtime to the host app as well:
 
 ```kotlin
 implementation("com.google.android.gms:play-services-ads-identifier:18.2.0")
+implementation("com.google.android.gms:play-services-appset:16.1.0")
 ```
 
 Keep `collectAdvertisingId = false` unless `ad_user_data` consent is available.
-The SDK also checks that persisted consent before reading GAID. Version 18.2.0
-preserves TrackHub's Android 5.0 / API 21 floor; Google 18.3.0 requires API 23.
+The SDK also checks that persisted consent before reading GAID. If GAID is
+unavailable or limited, the official App Set ID is used and `lat` retains the
+actual limit-ad-tracking/personalization state; it is
+never collected unless identifier collection is enabled and `ad_user_data` is
+granted. Version 18.2.0 preserves TrackHub's Android 5.0 / API 21 floor; Google
+18.3.0 requires API 23.
 
 ## Usage
 
@@ -96,6 +101,7 @@ TrackHub.configure(
     ingestToken = "<app ingest token>",
     userId = Apphud.userId(),
     sdkSecret = "<app sdk secret>", // required for the purchase bridge
+    countryCode = measurementCountry, // actual ISO-3166 country, not UI language
     collectAdvertisingId = true,   // only with ad_user_data consent
     apphudCollectDeviceIdentifiersHandler = {
         Apphud.collectDeviceIdentifiers()
@@ -138,7 +144,7 @@ purchase.orderId?.let { orderId ->
 }
 
 // Forward Google deep-link ids for session reattribution:
-TrackHub.handleDeepLink(intent.data!!)
+TrackHub.handleDeepLink(applicationContext, intent.data!!)
 ```
 
 `configure` reports the install once, starts automatic foreground session tracking and flushes the
@@ -176,14 +182,15 @@ When an SDK event is explicitly mapped to a Google App Conversion custom event, 
   attribution or erase an arbitrary identity. The host backend authorizes those operations with
   its S2S secret and returns only the scoped result to the SDK.
 - **Consent-gated identity** — user id, OS/app version, Play referrer, engagement events and a
-  stable transaction/product id. GAID is collected only when the host opts in and persisted
-  `ad_user_data` consent is true; limited/zero identifiers are discarded. No device
+  stable transaction/product id. GAID/App Set ID is collected only when the host opts in and persisted
+  `ad_user_data` consent is true; limited/zero advertising identifiers are discarded. No device
   fingerprinting. The server encrypts purchase context and deletes it after Apphud join or 72h.
-- **Spec-complete event context** — a stable first-open timestamp and ISO country accompany every
-  event so Google's required `fot` and `ctry_c` survive install/session request races.
+- **Spec-complete event context** — a stable first-open timestamp accompanies every event. Supply
+  the actual ISO country through `countryCode` (or configure TrackHub's trusted edge geo header);
+  the SDK deliberately does not mislabel Locale/language as geography.
 - **PIPL fail-closed support** — `setPiplConsent` persists mainland-China processing,
   cross-border-transfer and ads-measurement choices for server-side enforcement.
-- **Platform dependencies only** — the official Play Install Referrer and Google Advertising ID
+- **Platform dependencies only** — the official Play Install Referrer, Google Advertising ID and App Set ID
   clients; Apphud remains a host adapter rather than a hard SDK dependency.
 
 ## Hardening note

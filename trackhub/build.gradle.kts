@@ -36,6 +36,10 @@ dependencies {
     // runtime dependency themselves (documented in README). 18.2.0 is the
     // official Google artifact whose manifest still supports minSdk 21.
     compileOnly("com.google.android.gms:play-services-ads-identifier:18.2.0")
+    // Optional fallback identifier required by Google App Conversion when an
+    // advertising ID is unavailable or limited. Hosts that enable identifier
+    // collection add the same artifact at runtime (see README).
+    compileOnly("com.google.android.gms:play-services-appset:16.1.0")
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:core:1.6.1")

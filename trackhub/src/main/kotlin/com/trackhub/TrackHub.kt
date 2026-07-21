@@ -9,11 +9,14 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import com.google.android.gms.ads.identifier.AdvertisingIdClient
+import com.google.android.gms.appset.AppSet
+import com.google.android.gms.tasks.Tasks
 import com.android.installreferrer.api.InstallReferrerClient
 import com.android.installreferrer.api.InstallReferrerStateListener
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
+import java.net.URI
 import java.net.URL
 import java.net.URLDecoder
 import java.net.URLEncoder
@@ -24,6 +27,7 @@ import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 data class TrackHubAttribution(
     val revision: String,
@@ -101,7 +105,13 @@ object TrackHub {
     private const val INSTALL_UID_KEY = "install_uid"
     private const val DEVICE_ID_KEY = "device_id"
     private const val ADVERTISING_ID_KEY = "advertising_id"
+    private const val APP_SET_ID_KEY = "app_set_id"
     private const val LIMIT_AD_TRACKING_KEY = "limit_ad_tracking"
+    private const val PENDING_GCLID_KEY = "pending_gclid"
+    private const val PENDING_GBRAID_KEY = "pending_gbraid"
+    private const val GCLID_KEY = "gclid"
+    private const val GBRAID_KEY = "gbraid"
+    private const val COUNTRY_CODE_KEY = "country_code"
     private const val PUSH_TOKEN_KEY = "push_token_fcm"
     private const val APPHUD_ATTRIBUTION_REVISION_PREFIX = "apphud_attribution_revision_"
     private const val DEFERRED_RESOLVE_PREFIX = "deferred_resolve_"
@@ -141,6 +151,24 @@ object TrackHub {
     @Volatile private var trackingDisabled = false
     private var startedActivities = 0
 
+    internal fun isAllowedEndpoint(value: String): Boolean {
+        if (value != value.trim()) return false
+        return runCatching {
+            val uri = URI(value)
+            val scheme = uri.scheme?.lowercase(Locale.US)
+            val host = uri.host?.trim('[', ']')
+            if (uri.isOpaque || uri.userInfo != null || host.isNullOrBlank()) return@runCatching false
+            if (uri.rawQuery != null || uri.rawFragment != null) return@runCatching false
+            scheme == "https" || (
+                scheme == "http" && (
+                    host.equals("localhost", ignoreCase = true) ||
+                        host == "127.0.0.1" ||
+                        host == "::1"
+                )
+            )
+        }.getOrDefault(false)
+    }
+
     @JvmStatic
     @JvmOverloads
     fun configure(
@@ -159,12 +187,11 @@ object TrackHub {
         apphudAttributionHandler: ApphudAttributionHandler? = null,
         attributionChangedHandler: TrackHubAttributionChangedHandler? = null,
         deferredDeepLinkHandler: TrackHubDeferredDeepLinkHandler? = null,
+        countryCode: String? = null,
     ) {
         // Plaintext HTTP would expose the ingest token and let a MITM poison
         // attribution. localhost only for local development.
-        val isHttps = endpoint.startsWith("https://")
-        val isLocal = endpoint.startsWith("http://localhost") || endpoint.startsWith("http://127.0.0.1")
-        if (!isHttps && !isLocal) {
+        if (!isAllowedEndpoint(endpoint)) {
             log("refusing non-HTTPS endpoint — SDK not configured")
             return
         }
@@ -185,8 +212,13 @@ object TrackHub {
         this.debug = debug
 
         this.appContext = appContext
-        trackingDisabled = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getBoolean(PRIVACY_DISABLED_PREFIX + hashKey(ingestToken), false)
+        val prefs = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val prefsEdit = prefs.edit()
+        normalizedCountryCode(countryCode)?.let { prefsEdit.putString(COUNTRY_CODE_KEY, it) }
+        pendingGclid?.let { prefsEdit.putString(PENDING_GCLID_KEY, it).putString(GCLID_KEY, it) }
+        pendingGbraid?.let { prefsEdit.putString(PENDING_GBRAID_KEY, it).putString(GBRAID_KEY, it) }
+        prefsEdit.apply()
+        trackingDisabled = prefs.getBoolean(PRIVACY_DISABLED_PREFIX + hashKey(ingestToken), false)
         if (trackingDisabled) {
             log("tracking disabled after a forget-device request")
             return
@@ -215,6 +247,23 @@ object TrackHub {
     @JvmStatic
     fun setFirebaseAppInstanceId(appInstanceId: String) {
         if (appInstanceId.isNotEmpty()) firebaseAppInstanceId = appInstanceId
+    }
+
+    /**
+     * Set the actual ISO-3166 country where measurement originates. Device
+     * language/Locale is intentionally not used as geography. A trusted server
+     * edge may override this value from its geo header.
+     */
+    @JvmStatic
+    fun setCountryCode(context: Context, countryCode: String) {
+        val value = normalizedCountryCode(countryCode) ?: return
+        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit().putString(COUNTRY_CODE_KEY, value).apply()
+    }
+
+    internal fun normalizedCountryCode(raw: String?): String? {
+        val value = raw?.trim()?.uppercase(Locale.US) ?: return null
+        return value.takeIf { it.length == 2 && it != "XX" && it.all { c -> c in 'A'..'Z' } }
     }
 
     /** Persist Consent Mode signals and re-report them when already configured. */
@@ -333,7 +382,18 @@ object TrackHub {
                                 .putBoolean(PRIVACY_DISABLED_PREFIX + hashKey(token), true)
                                 .remove(pendingReportsKey())
                                 .remove(PUSH_TOKEN_KEY)
+                                .remove(ADVERTISING_ID_KEY)
+                                .remove(APP_SET_ID_KEY)
+                                .remove(PENDING_GCLID_KEY)
+                                .remove(PENDING_GBRAID_KEY)
+                                .remove(GCLID_KEY)
+                                .remove(GBRAID_KEY)
+                                .remove(DEFERRED_MATCH_TOKEN_KEY)
+                                .remove(DEVICE_ID_KEY)
+                                .remove(INSTALL_UID_KEY)
                                 .apply()
+                            pendingGclid = null
+                            pendingGbraid = null
                         }
                         completion?.let { callback -> runOnMain { callback(accepted) } }
                     }
@@ -406,13 +466,29 @@ object TrackHub {
 
     /** Capture Google deep-link ids for the next session_start reattribution. */
     @JvmStatic
-    fun handleDeepLink(uri: Uri): Boolean {
+    fun handleDeepLink(uri: Uri): Boolean = captureDeepLink(appContext, uri)
+
+    /**
+     * Cold-launch overload that persists click IDs before [configure]. Prefer
+     * this form from an Activity/Application intent handler.
+     */
+    @JvmStatic
+    fun handleDeepLink(context: Context, uri: Uri): Boolean =
+        captureDeepLink(context.applicationContext, uri)
+
+    private fun captureDeepLink(context: Context?, uri: Uri): Boolean {
         val gclid = uri.getQueryParameter("gclid")?.takeIf { it.isNotEmpty() }
         val gbraid = uri.getQueryParameter("gbraid")?.takeIf { it.isNotEmpty() }
         if (gclid == null && gbraid == null) return false
         pendingGclid = gclid
         pendingGbraid = gbraid
-        appContext?.let { context -> io.execute { beginSessionIfNeeded(context, force = true) } }
+        context?.let { persistedContext ->
+            val edit = persistedContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            gclid?.let { edit.putString(PENDING_GCLID_KEY, it).putString(GCLID_KEY, it) }
+            gbraid?.let { edit.putString(PENDING_GBRAID_KEY, it).putString(GBRAID_KEY, it) }
+            edit.apply()
+        }
+        appContext?.let { configured -> io.execute { beginSessionIfNeeded(configured, force = true) } }
         return true
     }
 
@@ -458,11 +534,16 @@ object TrackHub {
             .put("session_uid", UUID.randomUUID().toString())
             .put("session_num", seq)
             .put("started_at", iso8601(Date(now)))
-        pendingGclid?.let { body.put("gclid", it) }
-        pendingGbraid?.let { body.put("gbraid", it) }
+        val gclid = pendingGclid ?: prefs.getString(PENDING_GCLID_KEY, null)
+        val gbraid = pendingGbraid ?: prefs.getString(PENDING_GBRAID_KEY, null)
+        gclid?.let { body.put("gclid", it) }
+        gbraid?.let { body.put("gbraid", it) }
+        sendOrQueue("sdk/session", body.toString())
+        // sendOrQueue either delivered the exact payload or persisted it before
+        // returning, so clearing the one-shot source cannot lose the click id.
+        prefs.edit().remove(PENDING_GCLID_KEY).remove(PENDING_GBRAID_KEY).apply()
         pendingGclid = null
         pendingGbraid = null
-        sendOrQueue("sdk/session", body.toString())
         fetchAttributionIfNeeded()
     }
 
@@ -505,11 +586,14 @@ object TrackHub {
             .put("sdk_version", SDK_VERSION)
             .put("os_version", Build.VERSION.RELEASE ?: "")
             .put("occurred_at", iso8601(firstOpenAt(context)))
-        Locale.getDefault().country.takeIf { it.length == 2 }?.let { body.put("country", it) }
-        body.put("locale", Locale.getDefault().toLanguageTag())
-        body.put("build", Build.DISPLAY ?: "")
+        explicitCountryCode(prefs)?.let { body.put("country", it) }
+        body.put("locale", Locale.getDefault().toString())
+        body.put("device_model", Build.MODEL ?: "Android")
+        body.put("build", Build.ID ?: "")
         appVersion(context)?.let { body.put("app_version", it) }
         if (!referrer.isNullOrEmpty()) body.put("install_referrer", referrer)
+        prefs.getString(GCLID_KEY, null)?.let { body.put("gclid", it) }
+        prefs.getString(GBRAID_KEY, null)?.let { body.put("gbraid", it) }
         appendAdvertisingId(context, prefs, body)
         // Firebase app_instance_id (GA4 join key for server-confirmed conversions).
         firebaseAppInstanceId?.takeIf { it.isNotEmpty() }?.let { body.put("app_instance_id", it) }
@@ -563,7 +647,11 @@ object TrackHub {
         body: JSONObject,
     ) {
         if (!collectAdvertisingId || !prefs.getBoolean(AD_USER_DATA_KEY, false)) return
-        val info = runCatching { AdvertisingIdClient.getAdvertisingIdInfo(context) }.getOrNull()
+        val info = try {
+            AdvertisingIdClient.getAdvertisingIdInfo(context)
+        } catch (_: Throwable) {
+            null
+        }
         val id = info?.id?.takeIf {
             it.isNotBlank() && it != "00000000-0000-0000-0000-000000000000" && !info.isLimitAdTrackingEnabled
         }
@@ -577,8 +665,35 @@ object TrackHub {
             body.put("limit_ad_tracking", false)
         } else {
             prefs.edit().remove(ADVERTISING_ID_KEY).putBoolean(LIMIT_AD_TRACKING_KEY, true).apply()
+            val appSetId = resolveAppSetId(context, prefs)
+            if (appSetId != null) {
+                val limited = info?.isLimitAdTrackingEnabled
+                    ?: !prefs.getBoolean(AD_PERSONALIZATION_KEY, false)
+                body.put("device_id", appSetId)
+                body.put("device_id_type", "appsetid")
+                body.put("limit_ad_tracking", limited)
+                prefs.edit().putBoolean(LIMIT_AD_TRACKING_KEY, limited).apply()
+            }
         }
     }
+
+    private fun resolveAppSetId(
+        context: Context,
+        prefs: android.content.SharedPreferences,
+    ): String? {
+        prefs.getString(APP_SET_ID_KEY, null)?.takeIf(::isUuid)?.let { return it }
+        val fetched = try {
+            Tasks.await(AppSet.getClient(context).appSetIdInfo, 2, TimeUnit.SECONDS).id
+        } catch (_: Throwable) {
+            null
+        }
+        val value = fetched?.takeIf(::isUuid) ?: return null
+        prefs.edit().putString(APP_SET_ID_KEY, value).apply()
+        return value
+    }
+
+    private fun isUuid(value: String): Boolean =
+        runCatching { UUID.fromString(value) }.isSuccess
 
     private fun sendConsentUpdate(context: Context) {
         val uid = userId ?: return
@@ -724,26 +839,36 @@ object TrackHub {
             .joinToString("") { "%02x".format(it.toInt() and 0xff) }
 
     private fun deviceContextBody(context: Context): JSONObject {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val body = JSONObject()
             .put("occurred_at", iso8601(Date()))
             .put("first_open_at", iso8601(firstOpenAt(context)))
             .put("sdk_version", SDK_VERSION)
             .put("os_version", Build.VERSION.RELEASE ?: "")
-            .put("locale", Locale.getDefault().toLanguageTag())
+            .put("locale", Locale.getDefault().toString())
             .put("device_model", Build.MODEL ?: "Android")
-            .put("build", Build.DISPLAY ?: "")
+            .put("build", Build.ID ?: "")
         appVersion(context)?.let { body.put("app_version", it) }
-        Locale.getDefault().country.takeIf { it.length == 2 }?.let { body.put("country", it) }
-        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        explicitCountryCode(prefs)?.let { body.put("country", it) }
         if (collectAdvertisingId && prefs.getBoolean(AD_USER_DATA_KEY, false)) {
-            prefs.getString(ADVERTISING_ID_KEY, null)?.takeIf { it.isNotBlank() }?.let {
-                body.put("device_id", it)
+            val advertisingId = prefs.getString(ADVERTISING_ID_KEY, null)?.takeIf { it.isNotBlank() }
+            if (advertisingId != null) {
+                body.put("device_id", advertisingId)
                 body.put("device_id_type", "advertisingid")
                 body.put("limit_ad_tracking", prefs.getBoolean(LIMIT_AD_TRACKING_KEY, true))
+            } else {
+                prefs.getString(APP_SET_ID_KEY, null)?.takeIf(::isUuid)?.let {
+                    body.put("device_id", it)
+                    body.put("device_id_type", "appsetid")
+                    body.put("limit_ad_tracking", prefs.getBoolean(LIMIT_AD_TRACKING_KEY, true))
+                }
             }
         }
         return body
     }
+
+    private fun explicitCountryCode(prefs: android.content.SharedPreferences): String? =
+        normalizedCountryCode(prefs.getString(COUNTRY_CODE_KEY, null))
 
     private fun sendOrQueue(path: String, rawBody: String) {
         if (trackingDisabled) return
