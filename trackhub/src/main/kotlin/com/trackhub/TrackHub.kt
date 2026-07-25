@@ -94,7 +94,7 @@ enum class TrackHubSalesEvent(val value: String) {
 object TrackHub {
 
     /** SDK version reported to the platform for integration detection. */
-    const val SDK_VERSION = "1.5.0"
+    const val SDK_VERSION = "1.6.0"
 
     private const val PREFS = "trackhub"
     private const val INSTALL_SENT_KEY = "install_sent"
@@ -111,6 +111,8 @@ object TrackHub {
     private const val PENDING_GBRAID_KEY = "pending_gbraid"
     private const val GCLID_KEY = "gclid"
     private const val GBRAID_KEY = "gbraid"
+    private const val OPENAI_OPPREF_KEY = "openai_oppref"
+    private const val PENDING_OPENAI_OPPREF_KEY = "pending_openai_oppref"
     private const val COUNTRY_CODE_KEY = "country_code"
     private const val PUSH_TOKEN_KEY = "push_token_fcm"
     private const val APPHUD_ATTRIBUTION_REVISION_PREFIX = "apphud_attribution_revision_"
@@ -136,6 +138,7 @@ object TrackHub {
     @Volatile private var appContext: Context? = null
     @Volatile private var pendingGclid: String? = null
     @Volatile private var pendingGbraid: String? = null
+    @Volatile private var pendingOpenAiOppref: String? = null
     @Volatile private var debug = false
     @Volatile private var lifecycleRegistered = false
     @Volatile private var collectAdvertisingId = false
@@ -195,11 +198,32 @@ object TrackHub {
             log("refusing non-HTTPS endpoint — SDK not configured")
             return
         }
+        val configuredAppContext = context.applicationContext
+        val prefs = configuredAppContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (hasPersistedPrivacyDisable(configuredAppContext)) {
+            this.appContext = configuredAppContext
+            this.ingestToken = ingestToken
+            trackingDisabled = true
+            this.userId = null
+            this.firebaseAppInstanceId = null
+            pendingGclid = null
+            pendingGbraid = null
+            pendingOpenAiOppref = null
+            prefs.edit()
+                .remove(PENDING_GCLID_KEY)
+                .remove(PENDING_GBRAID_KEY)
+                .remove(GCLID_KEY)
+                .remove(GBRAID_KEY)
+                .remove(OPENAI_OPPREF_KEY)
+                .remove(PENDING_OPENAI_OPPREF_KEY)
+                .apply()
+            log("tracking disabled after a forget-device request")
+            return
+        }
         this.endpoint = endpoint.trimEnd('/')
         this.ingestToken = ingestToken
         this.sdkSecret = sdkSecret
-        val appContext = context.applicationContext
-        this.userId = userId?.takeIf { it.isNotBlank() } ?: persistentDeviceId(appContext)
+        this.userId = userId?.takeIf { it.isNotBlank() } ?: persistentDeviceId(configuredAppContext)
         if (!firebaseAppInstanceId.isNullOrEmpty()) this.firebaseAppInstanceId = firebaseAppInstanceId
         this.integrationTestToken = integrationTestToken?.trim()?.takeIf { it.length in 20..128 }
         this.collectAdvertisingId = collectAdvertisingId
@@ -211,26 +235,36 @@ object TrackHub {
         this.deferredDeepLinkHandler = deferredDeepLinkHandler
         this.debug = debug
 
-        this.appContext = appContext
-        val prefs = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        this.appContext = configuredAppContext
         val prefsEdit = prefs.edit()
         normalizedCountryCode(countryCode)?.let { prefsEdit.putString(COUNTRY_CODE_KEY, it) }
+        val hasPendingGoogleReference = pendingGclid != null || pendingGbraid != null
+        if (pendingOpenAiOppref != null && !hasPendingGoogleReference) {
+            prefsEdit
+                .remove(PENDING_GCLID_KEY)
+                .remove(PENDING_GBRAID_KEY)
+                .remove(GCLID_KEY)
+                .remove(GBRAID_KEY)
+        } else if (hasPendingGoogleReference && pendingOpenAiOppref == null) {
+            prefsEdit.remove(OPENAI_OPPREF_KEY).remove(PENDING_OPENAI_OPPREF_KEY)
+        }
         pendingGclid?.let { prefsEdit.putString(PENDING_GCLID_KEY, it).putString(GCLID_KEY, it) }
         pendingGbraid?.let { prefsEdit.putString(PENDING_GBRAID_KEY, it).putString(GBRAID_KEY, it) }
-        prefsEdit.apply()
-        trackingDisabled = prefs.getBoolean(PRIVACY_DISABLED_PREFIX + hashKey(ingestToken), false)
-        if (trackingDisabled) {
-            log("tracking disabled after a forget-device request")
-            return
+        pendingOpenAiOppref?.let {
+            prefsEdit
+                .putString(OPENAI_OPPREF_KEY, it)
+                .putString(PENDING_OPENAI_OPPREF_KEY, it)
         }
-        firstOpenAt(appContext)
-        registerLifecycle(appContext)
+        prefsEdit.apply()
+        trackingDisabled = false
+        firstOpenAt(configuredAppContext)
+        registerLifecycle(configuredAppContext)
         apphudCollectDeviceIdentifiersHandler?.let { handler -> runOnMain { handler() } }
         io.execute {
-            reportInstallIfNeeded(appContext)
-            reportPushTokenIfAvailable(appContext)
-            beginSessionIfNeeded(appContext)
-            flushPending(appContext)
+            reportInstallIfNeeded(configuredAppContext)
+            reportPushTokenIfAvailable(configuredAppContext)
+            beginSessionIfNeeded(configuredAppContext)
+            flushPending(configuredAppContext)
             fetchAttributionIfNeeded()
             resolveDeferredDeepLinkIfNeeded()
         }
@@ -246,7 +280,7 @@ object TrackHub {
      */
     @JvmStatic
     fun setFirebaseAppInstanceId(appInstanceId: String) {
-        if (appInstanceId.isNotEmpty()) firebaseAppInstanceId = appInstanceId
+        if (!trackingDisabled && appInstanceId.isNotEmpty()) firebaseAppInstanceId = appInstanceId
     }
 
     /**
@@ -256,6 +290,7 @@ object TrackHub {
      */
     @JvmStatic
     fun setCountryCode(context: Context, countryCode: String) {
+        if (trackingDisabled || hasPersistedPrivacyDisable(context.applicationContext)) return
         val value = normalizedCountryCode(countryCode) ?: return
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit().putString(COUNTRY_CODE_KEY, value).apply()
@@ -274,6 +309,7 @@ object TrackHub {
         adPersonalization: Boolean,
         eea: Boolean,
     ) {
+        if (trackingDisabled || hasPersistedPrivacyDisable(context.applicationContext)) return
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putBoolean(AD_USER_DATA_KEY, adUserData)
             .putBoolean(AD_PERSONALIZATION_KEY, adPersonalization)
@@ -293,6 +329,7 @@ object TrackHub {
         crossBorderTransferConsent: Boolean,
         adsMeasurementConsent: Boolean,
     ) {
+        if (trackingDisabled || hasPersistedPrivacyDisable(context.applicationContext)) return
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putBoolean(PIPL_CONSENT_KEY, piplConsent)
             .putBoolean(CROSS_BORDER_TRANSFER_CONSENT_KEY, crossBorderTransferConsent)
@@ -307,7 +344,7 @@ object TrackHub {
     /** Update the identity after Apphud resolves it. */
     @JvmStatic
     fun setUserId(userId: String) {
-        if (userId.isNotEmpty()) {
+        if (!trackingDisabled && userId.isNotEmpty()) {
             this.userId = userId
             io.execute {
                 appContext?.let { reportPushTokenIfAvailable(it) }
@@ -323,6 +360,7 @@ object TrackHub {
      */
     @JvmStatic
     fun setPushToken(context: Context, token: String) {
+        if (trackingDisabled || hasPersistedPrivacyDisable(context.applicationContext)) return
         val value = token.trim()
         if (value.length !in 32..4096) return
         val configured = context.applicationContext
@@ -388,12 +426,17 @@ object TrackHub {
                                 .remove(PENDING_GBRAID_KEY)
                                 .remove(GCLID_KEY)
                                 .remove(GBRAID_KEY)
+                                .remove(OPENAI_OPPREF_KEY)
+                                .remove(PENDING_OPENAI_OPPREF_KEY)
                                 .remove(DEFERRED_MATCH_TOKEN_KEY)
                                 .remove(DEVICE_ID_KEY)
                                 .remove(INSTALL_UID_KEY)
                                 .apply()
                             pendingGclid = null
                             pendingGbraid = null
+                            pendingOpenAiOppref = null
+                            userId = null
+                            firebaseAppInstanceId = null
                         }
                         completion?.let { callback -> runOnMain { callback(accepted) } }
                     }
@@ -464,7 +507,7 @@ object TrackHub {
         io.execute { sendOrQueue("sdk/purchase-context", body.toString()) }
     }
 
-    /** Capture Google deep-link ids for the next session_start reattribution. */
+    /** Capture Google or ChatGPT Ads deep-link ids for the next session reattribution. */
     @JvmStatic
     fun handleDeepLink(uri: Uri): Boolean = captureDeepLink(appContext, uri)
 
@@ -477,20 +520,53 @@ object TrackHub {
         captureDeepLink(context.applicationContext, uri)
 
     private fun captureDeepLink(context: Context?, uri: Uri): Boolean {
+        if (trackingDisabled || (context != null && hasPersistedPrivacyDisable(context))) {
+            pendingGclid = null
+            pendingGbraid = null
+            pendingOpenAiOppref = null
+            return false
+        }
         val gclid = uri.getQueryParameter("gclid")?.takeIf { it.isNotEmpty() }
         val gbraid = uri.getQueryParameter("gbraid")?.takeIf { it.isNotEmpty() }
-        if (gclid == null && gbraid == null) return false
+        val oppref = normalizedOpenAiOppref(uri.getQueryParameter("oppref"))
+        if (gclid == null && gbraid == null && oppref == null) return false
         pendingGclid = gclid
         pendingGbraid = gbraid
+        pendingOpenAiOppref = oppref
         context?.let { persistedContext ->
             val edit = persistedContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            val hasGoogleReference = gclid != null || gbraid != null
+            if (oppref != null && !hasGoogleReference) {
+                edit
+                    .remove(PENDING_GCLID_KEY)
+                    .remove(PENDING_GBRAID_KEY)
+                    .remove(GCLID_KEY)
+                    .remove(GBRAID_KEY)
+                pendingGclid = null
+                pendingGbraid = null
+            } else if (hasGoogleReference && oppref == null) {
+                edit.remove(OPENAI_OPPREF_KEY).remove(PENDING_OPENAI_OPPREF_KEY)
+            }
             gclid?.let { edit.putString(PENDING_GCLID_KEY, it).putString(GCLID_KEY, it) }
             gbraid?.let { edit.putString(PENDING_GBRAID_KEY, it).putString(GBRAID_KEY, it) }
+            oppref?.let {
+                edit
+                    .putString(OPENAI_OPPREF_KEY, it)
+                    .putString(PENDING_OPENAI_OPPREF_KEY, it)
+            }
             edit.apply()
         }
         appContext?.let { configured -> io.execute { beginSessionIfNeeded(configured, force = true) } }
         return true
     }
+
+    internal fun normalizedOpenAiOppref(raw: String?): String? =
+        raw?.trim()?.takeIf { it.isNotEmpty() && it.length <= 1024 }
+
+    private fun hasPersistedPrivacyDisable(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).all.any { (key, value) ->
+            key.startsWith(PRIVACY_DISABLED_PREFIX) && value == true
+        }
 
     // MARK: - Sessions
 
@@ -536,14 +612,21 @@ object TrackHub {
             .put("started_at", iso8601(Date(now)))
         val gclid = pendingGclid ?: prefs.getString(PENDING_GCLID_KEY, null)
         val gbraid = pendingGbraid ?: prefs.getString(PENDING_GBRAID_KEY, null)
+        val oppref = pendingOpenAiOppref ?: prefs.getString(PENDING_OPENAI_OPPREF_KEY, null)
         gclid?.let { body.put("gclid", it) }
         gbraid?.let { body.put("gbraid", it) }
+        oppref?.let { body.put("oppref", it) }
         sendOrQueue("sdk/session", body.toString())
         // sendOrQueue either delivered the exact payload or persisted it before
         // returning, so clearing the one-shot source cannot lose the click id.
-        prefs.edit().remove(PENDING_GCLID_KEY).remove(PENDING_GBRAID_KEY).apply()
+        prefs.edit()
+            .remove(PENDING_GCLID_KEY)
+            .remove(PENDING_GBRAID_KEY)
+            .remove(PENDING_OPENAI_OPPREF_KEY)
+            .apply()
         pendingGclid = null
         pendingGbraid = null
+        pendingOpenAiOppref = null
         fetchAttributionIfNeeded()
     }
 
@@ -594,6 +677,7 @@ object TrackHub {
         if (!referrer.isNullOrEmpty()) body.put("install_referrer", referrer)
         prefs.getString(GCLID_KEY, null)?.let { body.put("gclid", it) }
         prefs.getString(GBRAID_KEY, null)?.let { body.put("gbraid", it) }
+        prefs.getString(OPENAI_OPPREF_KEY, null)?.let { body.put("oppref", it) }
         appendAdvertisingId(context, prefs, body)
         // Firebase app_instance_id (GA4 join key for server-confirmed conversions).
         firebaseAppInstanceId?.takeIf { it.isNotEmpty() }?.let { body.put("app_instance_id", it) }

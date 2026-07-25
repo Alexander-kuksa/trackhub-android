@@ -47,11 +47,11 @@ dependencyResolutionManagement {
 }
 
 // app/build.gradle.kts
-implementation("com.github.Alexander-kuksa:trackhub-android:1.5.0")
+implementation("com.github.Alexander-kuksa:trackhub-android:1.6.0")
 ```
 
-(Requires a `1.5.0` git tag on the repo. Alternatively publish to GitHub Packages with
-`./gradlew :trackhub:publish` and consume `com.trackhub:trackhub-android:1.5.0`.)
+(Requires a `1.6.0` git tag on the repo. Alternatively publish to GitHub Packages with
+`./gradlew :trackhub:publish` and consume `com.trackhub:trackhub-android:1.6.0`.)
 
 The Play Install Referrer Library is pulled in transitively.
 
@@ -100,7 +100,7 @@ TrackHub.configure(
     endpoint = "https://postbacks.daively.com", // your ingest domain
     ingestToken = "<app ingest token>",
     userId = Apphud.userId(),
-    sdkSecret = "<app sdk secret>", // required for the purchase bridge
+    sdkSecret = "<app sdk secret>", // required for the purchase bridge and ChatGPT Ads
     countryCode = measurementCountry, // actual ISO-3166 country, not UI language
     collectAdvertisingId = true,   // only with ad_user_data consent
     apphudCollectDeviceIdentifiersHandler = {
@@ -143,19 +143,22 @@ purchase.orderId?.let { orderId ->
     )
 }
 
-// Forward Google deep-link ids for session reattribution:
+// Forward Google (gclid/gbraid) or ChatGPT Ads (oppref) deep-link ids:
 TrackHub.handleDeepLink(applicationContext, intent.data!!)
 ```
 
 `configure` reports the install once, starts automatic foreground session tracking and flushes the
 bounded offline queue. `sdkSecret` is optional for ordinary measurement but required for
-`trackPurchaseObserved`, because an unsigned bearer-token request must never control an ads
-conversion. `userId` is optional; the SDK creates a persistent app-scoped fallback. Firebase is
-not required. `getAttribution`, `resolveDeferredDeepLink` and `forgetDevice` are also public for
-explicit refresh, routing and privacy-erasure flows. Attribution and erasure fail closed unless
-the corresponding `AppBackend` callback is supplied. That backend authenticates the signed-in
-user, calls TrackHub with a linked S2S connection's `X-TrackHub-Token`, and returns only the raw
-attribution response or success flag; the S2S token must never reach the app.
+`trackPurchaseObserved` and ChatGPT Ads conversion reporting, because an unsigned bearer-token
+request must never control an ads conversion. For a cold launch from a ChatGPT ad, call the
+context overload of `handleDeepLink` before `configure`: the bounded `oppref` is included in the
+signed install and exactly one ad-click session report. `userId` is optional; the SDK creates a
+persistent app-scoped fallback. Firebase is not required. `getAttribution`,
+`resolveDeferredDeepLink` and `forgetDevice` are also public for explicit refresh, routing and
+privacy-erasure flows. Attribution and erasure fail closed unless the corresponding `AppBackend`
+callback is supplied. That backend authenticates the signed-in user, calls TrackHub with a linked
+S2S connection's `X-TrackHub-Token`, and returns only the raw attribution response or success
+flag; the S2S token must never reach the app.
 
 TrackHub-owned Google Play links add an opaque `trackhub_match_token` to Install Referrer. The SDK
 returns that token once to `/resolve`, consumes it after a successful response and never uses IP or

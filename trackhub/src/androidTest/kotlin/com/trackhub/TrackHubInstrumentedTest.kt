@@ -2,6 +2,7 @@ package com.trackhub
 
 import android.content.Context
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.SystemClock
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -18,7 +19,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicBoolean
 
 @RunWith(AndroidJUnit4::class)
 class TrackHubInstrumentedTest {
@@ -28,9 +31,16 @@ class TrackHubInstrumentedTest {
         val testToken = "test-run-token-with-enough-entropy-1234"
         val queueKey = "pending_reports_${TrackHub.offlineQueueNamespace(testToken)}"
         val prefs = context.getSharedPreferences("trackhub", Context.MODE_PRIVATE)
-        prefs.edit().remove(queueKey).apply()
+        prefs.edit()
+            .remove(queueKey)
+            .putString("gclid", "stale_google_click")
+            .putString("pending_gclid", "stale_google_click")
+            .apply()
 
         val trackAttempts = AtomicInteger(0)
+        val erasureHandler: TrackHubBackendPrivacyErasureHandler = { _, _, completion ->
+            completion(true)
+        }
         val server = MockWebServer()
         server.dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
@@ -44,6 +54,21 @@ class TrackHubInstrumentedTest {
         server.start()
         try {
             val endpoint = server.url("/").toString().trimEnd('/')
+            assertFalse(
+                TrackHub.handleDeepLink(
+                    context,
+                    Uri.parse("https://app.example/open?oppref=${"x".repeat(1025)}"),
+                ),
+            )
+            assertTrue(
+                TrackHub.handleDeepLink(
+                    context,
+                    Uri.parse("https://app.example/open?oppref=chatgpt-click-123"),
+                ),
+            )
+            assertFalse(prefs.contains("gclid"))
+            assertFalse(prefs.contains("pending_gclid"))
+
             TrackHub.configure(
                 context = context,
                 endpoint = endpoint,
@@ -52,7 +77,13 @@ class TrackHubInstrumentedTest {
                 sdkSecret = "test-sdk-secret",
                 debug = true,
                 integrationTestToken = testToken,
+                backendPrivacyErasureHandler = erasureHandler,
             )
+
+            val opprefPayloads = waitForOpprefPayloads(server)
+            assertEquals("chatgpt-click-123", opprefPayloads.getValue("install").getString("oppref"))
+            assertEquals("chatgpt-click-123", opprefPayloads.getValue("session").getString("oppref"))
+
             TrackHub.trackEvent("integration_probe", callbackParams = mapOf("screen" to "paywall"))
 
             val firstTrack = waitForTrackRequest(server)
@@ -74,9 +105,28 @@ class TrackHubInstrumentedTest {
                 userId = "qa-device-user",
                 sdkSecret = "test-sdk-secret",
                 integrationTestToken = testToken,
+                backendPrivacyErasureHandler = erasureHandler,
             )
             waitForTrackRequest(server)
             waitUntil { JSONArray(prefs.getString(queueKey, "[]")).length() == 0 }
+
+            val forgotten = AtomicBoolean(false)
+            val forgetCompleted = CountDownLatch(1)
+            TrackHub.forgetDevice { accepted ->
+                forgotten.set(accepted)
+                forgetCompleted.countDown()
+            }
+            assertTrue(forgetCompleted.await(5, TimeUnit.SECONDS))
+            assertTrue(forgotten.get())
+            assertFalse(prefs.contains("openai_oppref"))
+            assertFalse(prefs.contains("pending_openai_oppref"))
+            assertFalse(
+                TrackHub.handleDeepLink(
+                    context,
+                    Uri.parse("https://app.example/open?oppref=must-not-survive-erasure"),
+                ),
+            )
+            assertFalse(prefs.contains("openai_oppref"))
 
             val permissions = context.packageManager
                 .getPackageInfo(context.packageName, PackageManager.GET_PERMISSIONS)
@@ -86,9 +136,24 @@ class TrackHubInstrumentedTest {
             assertFalse(permissions.contains("com.google.android.gms.permission.AD_ID"))
             assertTrue(permissions.contains("android.permission.INTERNET"))
         } finally {
-            prefs.edit().remove(queueKey).apply()
+            prefs.edit().clear().apply()
             server.shutdown()
         }
+    }
+
+    private fun waitForOpprefPayloads(server: MockWebServer): Map<String, JSONObject> {
+        val payloads = mutableMapOf<String, JSONObject>()
+        repeat(20) {
+            val request = server.takeRequest(1, TimeUnit.SECONDS) ?: return@repeat
+            val key = when {
+                request.path?.endsWith("/install") == true -> "install"
+                request.path?.endsWith("/sdk/session") == true -> "session"
+                else -> null
+            }
+            if (key != null) payloads[key] = JSONObject(request.body.readUtf8())
+            if (payloads.keys.containsAll(setOf("install", "session"))) return payloads
+        }
+        throw AssertionError("TrackHub did not send both oppref install and session payloads")
     }
 
     private fun waitForTrackRequest(server: MockWebServer): RecordedRequest {
