@@ -1,5 +1,9 @@
 # TrackHub Android SDK
 
+> **Текущая версия:** `1.6.1` · **minSdk:** 21 · **compileSdk:** 34 ·
+> **проверено:** 6 августа 2026 г. Полная документация платформы:
+> [`docs/README.md`](../docs/README.md); wire-контракт: [`docs/SDK_CONTRACT.md`](../docs/SDK_CONTRACT.md).
+
 Kotlin SDK for TrackHub: install/referrer attribution, automatic app sessions, custom engagement
 events and the App Conversion purchase bridge. Revenue stays authoritative in Apphud/S2S; the SDK
 never accepts a price or currency.
@@ -20,6 +24,9 @@ never accepts a price or currency.
 # Locally, install JDK 17 + Gradle 8.7 (or open in Android Studio), then:
 gradle :trackhub:test            # unit tests, incl. the signature parity vector
 gradle :trackhub:assembleRelease # build the release AAR
+gradle :trackhub:lint            # Android lint
+gradle :trackhub:assembleDebugAndroidTest
+gradle :trackhub:connectedDebugAndroidTest # requires a running API 34 emulator/device
 ```
 
 ## Why Android differs from iOS
@@ -47,11 +54,11 @@ dependencyResolutionManagement {
 }
 
 // app/build.gradle.kts
-implementation("com.github.Alexander-kuksa:trackhub-android:1.6.0")
+implementation("com.github.Alexander-kuksa:trackhub-android:1.6.1")
 ```
 
-(Requires a `1.6.0` git tag on the repo. Alternatively publish to GitHub Packages with
-`./gradlew :trackhub:publish` and consume `com.trackhub:trackhub-android:1.6.0`.)
+(Requires a `1.6.1` git tag on the repo. Alternatively publish to GitHub Packages with
+`./gradlew :trackhub:publish` and consume `com.trackhub:trackhub-android:1.6.1`.)
 
 The Play Install Referrer Library is pulled in transitively.
 
@@ -173,6 +180,36 @@ uninstall only when FCM explicitly returns `UNREGISTERED`, never on a timeout or
 When an SDK event is explicitly mapped to a Google App Conversion custom event, bounded primitive
 `callbackParams` become Google `app_event_data`; `partnerParams` are retained in TrackHub only.
 
+## Поведение при сбоях
+
+Сбой или недоступность TrackHub не должны приводить к падению host app. Все сетевые ошибки перехватываются,
+state/persistence и delivery работают на разных последовательных executors, а host callbacks
+ограничены watchdog. Точные пределы версии `1.6.1`:
+
+| Механизм | Гарантия |
+|---|---|
+| Запись | Install/session/event сначала фиксируется в `AtomicFile` в `noBackupFilesDir` на IO executor и только затем попадает в network delivery |
+| Очередь | Не более 1 000 отчётов и 4 MiB; один payload — не более 64 KiB |
+| Переполнение | Вытесняются старые обычные события; production install имеет приоритет |
+| Параллелизм | Один delivery worker, максимум один активный POST |
+| Файловая гонка | Чтение, запись, backup-restore и privacy-delete одной очереди сериализованы общим lock; диагностический read не может восстановить устаревший `.bak` поверх нового commit |
+| Таймауты | Connect/read по 10 секунд; общее чтение GET до 15 секунд и 64 KiB (защита от slow response) |
+| Повторы | Transport failure, HTTP `408`, `429`, `5xx`; exponential backoff+jitter от 0,5 секунды до 5 минут |
+| Без повторов | Остальные `4xx` удаляются как постоянная ошибка контракта |
+| Install | `INSTALL_SENT_KEY` записывается только после HTTP `2xx`; неподтверждённый install переживает перезапуск |
+| Host callbacks | Watchdog 15 секунд; зависший Apphud/backend callback не удерживает SDK бесконечно |
+| Privacy erase | Успешный `forgetDevice` очищает очередь и постоянно блокирует tracking для этого app token |
+
+При первом запуске `1.6.1` старая очередь из `SharedPreferences` (SDK ≤ `1.6.0`)
+атомарно переносится в файл. Legacy-значение удаляется только после успешного
+commit. Повреждённый/превышающий recovery-limit файл переименовывается в
+`*.corrupt-<timestamp>`, а не затирается молча. Одноразовые click refs стираются только
+после подтверждённой записи session payload.
+
+Если локальная запись невозможна либо payload превышает лимит, SDK отбрасывает конкретный отчёт,
+логирует причину при debug-режиме и продолжает работу приложения. Повтор одного отчёта после сбоя
+безопасен благодаря стабильным идентификаторам и серверной дедупликации.
+
 ## Security properties (parity with the iOS SDK, reviewed)
 
 - **HTTPS enforced** — non-HTTPS endpoints are refused (localhost exempt for development).
@@ -204,3 +241,20 @@ Like any client SDK (and like the paid Adjust SDK), the `sdkSecret` ships inside
 Signature raises the cost of forging organic installs, it does not make it impossible. There is
 no certificate pinning by default (ATS-equivalent TLS applies); add pinning via
 `network_security_config.xml` if your threat model requires it.
+
+## Проверка интеграции и обновление
+
+Перед production release:
+
+1. Закрепите зависимость на tag `1.6.1`; не используйте moving branch или `-SNAPSHOT`.
+2. Запустите unit, lint, release AAR и API 34 instrumentation команды из начала документа.
+3. Соберите приложение-потребитель и проверьте, что merge manifest не добавил `AD_ID`, если
+   `collectAdvertisingId=false`.
+4. На Play-enabled устройстве проверьте Install Referrer, cold-start deep link, Apphud identifiers,
+   FCM token и успешную покупку без передачи цены из SDK.
+5. Пройдите TrackHub Integration Test Lab, затем отдельно разрешённый live canary. Test token
+   не должен попасть в production build.
+
+При обновлении сохраняйте существующие `ingestToken`, `sdkSecret`, Apphud `userId` и локальные
+данные приложения. Ротация секретов выполняется сначала на сервере с grace period, затем в новой
+версии клиента; S2S token остаётся только на backend приложения.

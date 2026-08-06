@@ -56,7 +56,7 @@ publishing {
         create<MavenPublication>("release") {
             groupId = "com.trackhub"
             artifactId = "trackhub-android"
-            version = "1.6.0"
+            version = "1.6.1"
             afterEvaluate { from(components["release"]) }
         }
     }

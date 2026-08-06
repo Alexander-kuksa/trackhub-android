@@ -9,6 +9,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.AtomicFile
 import com.google.android.gms.ads.identifier.AdvertisingIdClient
 import com.google.android.gms.appset.AppSet
 import com.google.android.gms.tasks.Tasks
@@ -17,6 +18,8 @@ import com.android.installreferrer.api.InstallReferrerStateListener
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
@@ -96,14 +99,13 @@ enum class TrackHubSalesEvent(val value: String) {
  * )
  * ```
  */
-// Queue and privacy mutations deliberately use commit() on the dedicated `io`
-// executor: returning from those state transitions before the bytes are durable
-// would reintroduce event loss or incomplete erasure after a process crash.
+// Queue and privacy mutations run on the dedicated `io` executor. The event
+// queue uses AtomicFile; small privacy flags still use synchronous commit().
 @SuppressLint("ApplySharedPref")
 object TrackHub {
 
     /** SDK version reported to the platform for integration detection. */
-    const val SDK_VERSION = "1.6.0"
+    const val SDK_VERSION = "1.6.1"
 
     private const val PREFS = "trackhub"
     private const val INSTALL_SENT_KEY = "install_sent"
@@ -139,6 +141,7 @@ object TrackHub {
     private const val MAX_PENDING_BYTES = 4 * 1024 * 1024
     private const val MAX_REPORT_BYTES = 64 * 1024
     private const val MAX_RESPONSE_BYTES = 64 * 1024
+    private const val MAX_RESPONSE_READ_MS = 15_000L
     private const val CALLBACK_TIMEOUT_MS = 15_000L
     private const val RETRY_BASE_MS = 1_000L
     private const val RETRY_MAX_MS = 5 * 60_000L
@@ -241,7 +244,7 @@ object TrackHub {
         }
         val configuredAppContext = context.applicationContext
         val prefs = configuredAppContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        if (hasPersistedPrivacyDisable(configuredAppContext)) {
+        if (hasPersistedPrivacyDisable(configuredAppContext, ingestToken)) {
             this.appContext = configuredAppContext
             this.ingestToken = ingestToken
             trackingDisabled = true
@@ -465,6 +468,7 @@ object TrackHub {
                         trackingDisabled = true
                         currentAttribution = null
                         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                        deletePendingQueue(context, pendingReportsKey())
                         prefs.edit()
                             .putBoolean(PRIVACY_DISABLED_PREFIX + hashKey(token), true)
                             .remove(pendingReportsKey())
@@ -651,10 +655,14 @@ object TrackHub {
     internal fun normalizedOpenAiOppref(raw: String?): String? =
         raw?.trim()?.takeIf { it.isNotEmpty() && it.length <= 1024 }
 
-    private fun hasPersistedPrivacyDisable(context: Context): Boolean =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).all.any { (key, value) ->
-            key.startsWith(PRIVACY_DISABLED_PREFIX) && value == true
-        }
+    private fun hasPersistedPrivacyDisable(
+        context: Context,
+        token: String? = ingestToken,
+    ): Boolean {
+        val scopedToken = token?.takeIf { it.isNotBlank() } ?: return trackingDisabled
+        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(PRIVACY_DISABLED_PREFIX + hashKey(scopedToken), false)
+    }
 
     // MARK: - Sessions
 
@@ -704,17 +712,18 @@ object TrackHub {
         gclid?.let { body.put("gclid", it) }
         gbraid?.let { body.put("gbraid", it) }
         oppref?.let { body.put("oppref", it) }
-        sendOrQueue("sdk/session", body.toString())
-        // sendOrQueue either delivered the exact payload or persisted it before
-        // returning, so clearing the one-shot source cannot lose the click id.
-        prefs.edit()
-            .remove(PENDING_GCLID_KEY)
-            .remove(PENDING_GBRAID_KEY)
-            .remove(PENDING_OPENAI_OPPREF_KEY)
-            .apply()
-        pendingGclid = null
-        pendingGbraid = null
-        pendingOpenAiOppref = null
+        if (sendOrQueue("sdk/session", body.toString())) {
+            // Clear one-shot sources only after the exact session payload is
+            // durable. A full/unwritable queue must not lose attribution.
+            prefs.edit()
+                .remove(PENDING_GCLID_KEY)
+                .remove(PENDING_GBRAID_KEY)
+                .remove(PENDING_OPENAI_OPPREF_KEY)
+                .apply()
+            pendingGclid = null
+            pendingGbraid = null
+            pendingOpenAiOppref = null
+        }
         fetchAttributionIfNeeded()
     }
 
@@ -1101,17 +1110,18 @@ object TrackHub {
         rawBody: String,
         kind: String? = null,
         dedupeKey: String? = null,
-    ) {
-        if (trackingDisabled) return
-        val context = appContext ?: return
+    ): Boolean {
+        if (trackingDisabled) return false
+        val context = appContext ?: return false
         val preparedBody = withIntegrationTestToken(rawBody)
         if (preparedBody.toByteArray(Charsets.UTF_8).size > MAX_REPORT_BYTES) {
             log("$path payload exceeds ${MAX_REPORT_BYTES} bytes — skipped")
-            return
+            return false
         }
         val queueKey = pendingReportsKey()
-        if (!enqueuePending(context, queueKey, path, preparedBody, kind, dedupeKey)) return
+        if (!enqueuePending(context, queueKey, path, preparedBody, kind, dedupeKey)) return false
         scheduleNextDelivery(context)
+        return true
     }
 
     private fun enqueuePending(
@@ -1122,8 +1132,7 @@ object TrackHub {
         kind: String?,
         dedupeKey: String?,
     ): Boolean {
-        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val items = loadPending(prefs, queueKey)
+        val items = loadPending(context, queueKey)
         val now = System.currentTimeMillis()
         var existingIndex = -1
         if (dedupeKey != null) {
@@ -1152,7 +1161,7 @@ object TrackHub {
             log("offline queue could not be bounded — report skipped")
             return false
         }
-        if (!prefs.edit().putString(queueKey, encoded).commit()) {
+        if (!persistPending(context, queueKey, items)) {
             log("offline queue write failed — report skipped")
             return false
         }
@@ -1189,21 +1198,89 @@ object TrackHub {
         return 0
     }
 
-    private fun loadPending(
-        prefs: android.content.SharedPreferences,
-        queueKey: String,
-    ): JSONArray {
-        val raw = prefs.getString(queueKey, "[]") ?: "[]"
-        if (raw.toByteArray(Charsets.UTF_8).size > MAX_PENDING_BYTES * 2) {
-            log("offline queue exceeded its recovery limit — resetting")
-            prefs.edit().putString(queueKey, "[]").commit()
-            return JSONArray()
+    private fun pendingQueueFile(context: Context, queueKey: String): File =
+        File(context.noBackupFilesDir, "trackhub-$queueKey.json")
+
+    // AtomicFile makes each replacement crash-safe, but its backup-restore
+    // protocol is not a cross-thread lock. Serialize readers, writers and
+    // deletion so a diagnostic read (or privacy erase) cannot restore an old
+    // .bak file while the state executor is committing a newer queue.
+    @Synchronized
+    private fun loadPending(context: Context, queueKey: String): JSONArray {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val file = pendingQueueFile(context, queueKey)
+        val backup = File(file.path + ".bak")
+        if (!file.exists() && !backup.exists() && prefs.contains(queueKey)) {
+            // One-time migration from SDK <= 1.6.0. Delete the legacy value
+            // only after AtomicFile has durably committed the same queue.
+            val legacy = prefs.getString(queueKey, "[]") ?: "[]"
+            val migrated = decodePending(legacy)
+            if (migrated != null && persistPending(context, queueKey, migrated)) {
+                prefs.edit().remove(queueKey).commit()
+                return migrated
+            }
+            log("legacy offline queue migration could not be completed")
+            return migrated ?: JSONArray()
         }
-        return runCatching { JSONArray(raw) }.getOrElse {
-            log("offline queue was corrupt — resetting")
-            prefs.edit().putString(queueKey, "[]").commit()
-            JSONArray()
+        if (!file.exists() && !backup.exists()) return JSONArray()
+
+        val atomic = AtomicFile(file)
+        val raw = runCatching {
+            atomic.openRead().use { input ->
+                val output = ByteArrayOutputStream()
+                val buffer = ByteArray(8192)
+                while (output.size() <= MAX_PENDING_BYTES * 2) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    output.write(buffer, 0, read)
+                }
+                if (output.size() > MAX_PENDING_BYTES * 2) null
+                else output.toString(Charsets.UTF_8.name())
+            }
+        }.getOrNull()
+        val decoded = raw?.let(::decodePending)
+        if (decoded != null) return decoded
+
+        quarantinePendingQueue(file)
+        log("offline queue was corrupt or oversized — quarantined")
+        return JSONArray()
+    }
+
+    private fun decodePending(raw: String): JSONArray? {
+        if (raw.toByteArray(Charsets.UTF_8).size > MAX_PENDING_BYTES * 2) return null
+        return runCatching { JSONArray(raw) }.getOrNull()
+    }
+
+    @Synchronized
+    private fun persistPending(context: Context, queueKey: String, items: JSONArray): Boolean {
+        val bytes = items.toString().toByteArray(Charsets.UTF_8)
+        if (bytes.size > MAX_PENDING_BYTES) return false
+        val atomic = AtomicFile(pendingQueueFile(context, queueKey))
+        var output: FileOutputStream? = null
+        return try {
+            output = atomic.startWrite()
+            output.write(bytes)
+            output.flush()
+            atomic.finishWrite(output)
+            true
+        } catch (_: Throwable) {
+            output?.let { runCatching { atomic.failWrite(it) } }
+            false
         }
+    }
+
+    private fun quarantinePendingQueue(file: File) {
+        val suffix = ".corrupt-${System.currentTimeMillis()}"
+        val backup = File(file.path + ".bak")
+        if (file.exists()) runCatching { file.renameTo(File(file.path + suffix)) }
+        if (backup.exists()) runCatching { backup.renameTo(File(backup.path + suffix)) }
+    }
+
+    @Synchronized
+    private fun deletePendingQueue(context: Context, queueKey: String) {
+        runCatching { AtomicFile(pendingQueueFile(context, queueKey)).delete() }
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit().remove(queueKey).commit()
     }
 
     private fun flushPending(context: Context) {
@@ -1214,15 +1291,14 @@ object TrackHub {
     private fun scheduleNextDelivery(context: Context) {
         if (trackingDisabled || deliveryInFlight) return
         val queueKey = pendingReportsKey()
-        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val items = loadPending(prefs, queueKey)
+        val items = loadPending(context, queueKey)
         while (items.length() > 0) {
             val raw = items.optJSONObject(0)
             val path = raw?.optString("path").orEmpty()
             val body = raw?.optString("body").orEmpty()
             if (raw != null && path.isNotEmpty() && body.isNotEmpty()) break
             items.remove(0)
-            prefs.edit().putString(queueKey, items.toString()).commit()
+            persistPending(context, queueKey, items)
         }
         val raw = items.optJSONObject(0) ?: return
         val pending = PendingDelivery(
@@ -1235,7 +1311,7 @@ object TrackHub {
         )
         if (!raw.has("id")) {
             raw.put("id", pending.id)
-            prefs.edit().putString(queueKey, items.toString()).commit()
+            persistPending(context, queueKey, items)
         }
         val targetAtMs = maxOf(pending.nextAttemptAtMs, transientRetryNotBeforeMs)
         val delayMs = targetAtMs - System.currentTimeMillis()
@@ -1275,7 +1351,7 @@ object TrackHub {
         code: Int,
     ) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val items = loadPending(prefs, queueKey)
+        val items = loadPending(context, queueKey)
         var index = -1
         for (i in 0 until items.length()) {
             if (items.optJSONObject(i)?.optString("id") == pending.id) {
@@ -1297,7 +1373,7 @@ object TrackHub {
             // If durable storage is temporarily unavailable, retain an
             // in-process deadline so a write failure cannot create a hot loop.
             transientRetryNotBeforeMs = nextAttemptAtMs
-            if (!prefs.edit().putString(queueKey, items.toString()).commit()) {
+            if (!persistPending(context, queueKey, items)) {
                 log("${pending.path} retry state could not be persisted")
             }
             log("${pending.path} delivery failed — retrying with backoff")
@@ -1305,7 +1381,10 @@ object TrackHub {
         }
 
         items.remove(index)
-        prefs.edit().putString(queueKey, items.toString()).commit()
+        if (!persistPending(context, queueKey, items)) {
+            log("${pending.path} delivery state could not be persisted")
+            return
+        }
         if (code in 200..299) {
             when (pending.kind) {
                 "production_install" -> {
@@ -1332,6 +1411,26 @@ object TrackHub {
         // Keep the historical production key so an SDK update does not strand
         // real reports already buffered by an older version.
         return if (namespace == "production") PENDING_REPORTS_KEY else "${PENDING_REPORTS_KEY}_$namespace"
+    }
+
+    internal fun offlineQueueCount(context: Context, testToken: String?): Int =
+        loadPending(context.applicationContext, pendingReportsKey(testToken)).length()
+
+    internal fun offlineQueuePathCount(
+        context: Context,
+        testToken: String?,
+        path: String,
+    ): Int {
+        val items = loadPending(context.applicationContext, pendingReportsKey(testToken))
+        var count = 0
+        for (i in 0 until items.length()) {
+            if (items.optJSONObject(i)?.optString("path") == path) count += 1
+        }
+        return count
+    }
+
+    internal fun clearOfflineQueueForTest(context: Context, testToken: String?) {
+        deletePendingQueue(context.applicationContext, pendingReportsKey(testToken))
     }
 
     private fun withIntegrationTestToken(rawBody: String): String {
@@ -1413,7 +1512,11 @@ object TrackHub {
         return stream.use { input ->
             val output = ByteArrayOutputStream()
             val buffer = ByteArray(4096)
+            val deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(MAX_RESPONSE_READ_MS)
             while (output.size() < MAX_RESPONSE_BYTES) {
+                val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime())
+                if (remainingMs <= 0) break
+                conn.readTimeout = min(10_000L, remainingMs).coerceAtLeast(1L).toInt()
                 val remaining = MAX_RESPONSE_BYTES - output.size()
                 val read = input.read(buffer, 0, min(buffer.size, remaining))
                 if (read <= 0) break

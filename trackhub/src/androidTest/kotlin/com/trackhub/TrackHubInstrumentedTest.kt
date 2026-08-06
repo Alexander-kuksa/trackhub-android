@@ -10,7 +10,6 @@ import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
-import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -29,8 +28,8 @@ class TrackHubInstrumentedTest {
     fun signedTestLabPayloadRetriesOfflineWithoutAdvertisingIdPermission() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val testToken = "test-run-token-with-enough-entropy-1234"
-        val queueKey = "pending_reports_${TrackHub.offlineQueueNamespace(testToken)}"
         val prefs = context.getSharedPreferences("trackhub", Context.MODE_PRIVATE)
+        TrackHub.clearOfflineQueueForTest(context, testToken)
         prefs.edit()
             .clear()
             .putString("gclid", "stale_google_click")
@@ -96,7 +95,8 @@ class TrackHubInstrumentedTest {
             assertFalse(body.has("revenue_cents"))
             assertNotNull(firstTrack.getHeader("X-TrackHub-Timestamp"))
             assertNotNull(firstTrack.getHeader("X-TrackHub-Signature"))
-            waitUntil { JSONArray(prefs.getString(queueKey, "[]")).length() == 1 }
+            waitUntil { TrackHub.offlineQueueCount(context, testToken) == 1 }
+            assertFalse(prefs.contains("pending_reports_${TrackHub.offlineQueueNamespace(testToken)}"))
             allowTrackRecovery.set(true)
 
             // Reconfigure in the same Test Lab namespace: only that queue is
@@ -107,14 +107,15 @@ class TrackHubInstrumentedTest {
                 ingestToken = "test-ingest-token-with-enough-entropy-1234",
                 userId = "qa-device-user",
                 sdkSecret = "test-sdk-secret",
+                debug = true,
                 integrationTestToken = testToken,
                 backendPrivacyErasureHandler = erasureHandler,
             )
             waitForTrackRequest(server)
-            waitUntil { JSONArray(prefs.getString(queueKey, "[]")).length() == 0 }
+            waitUntil { TrackHub.offlineQueueCount(context, testToken) == 0 }
 
             val outageToken = "outage-resilience-token-with-enough-entropy-5678"
-            val outageQueueKey = "pending_reports_${TrackHub.offlineQueueNamespace(outageToken)}"
+            TrackHub.clearOfflineQueueForTest(context, outageToken)
             TrackHub.configure(
                 context = context,
                 endpoint = "http://127.0.0.1:9",
@@ -137,12 +138,7 @@ class TrackHubInstrumentedTest {
             assertTrue("public tracking calls blocked for ${enqueueCallMs}ms", enqueueCallMs < 2_000)
 
             waitUntil(timeoutMs = 10_000) {
-                val items = JSONArray(prefs.getString(outageQueueKey, "[]"))
-                var trackCount = 0
-                for (i in 0 until items.length()) {
-                    if (items.optJSONObject(i)?.optString("path") == "sdk/track") trackCount++
-                }
-                trackCount >= 25
+                TrackHub.offlineQueuePathCount(context, outageToken, "sdk/track") >= 25
             }
 
             val forgotten = AtomicBoolean(false)
@@ -171,6 +167,7 @@ class TrackHubInstrumentedTest {
             assertFalse(permissions.contains("com.google.android.gms.permission.AD_ID"))
             assertTrue(permissions.contains("android.permission.INTERNET"))
         } finally {
+            TrackHub.clearOfflineQueueForTest(context, testToken)
             prefs.edit().clear().commit()
             server.shutdown()
         }
