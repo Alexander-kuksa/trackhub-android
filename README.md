@@ -148,7 +148,9 @@ TrackHub.handleDeepLink(applicationContext, intent.data!!)
 ```
 
 `configure` reports the install once, starts automatic foreground session tracking and flushes the
-bounded offline queue. `sdkSecret` is optional for ordinary measurement but required for
+bounded offline queue. Every install/session/event is committed to that queue before network delivery;
+one worker drains it with timeouts and bounded backoff, so a TrackHub outage cannot block SDK state or
+fan out requests inside the host app. `sdkSecret` is optional for ordinary measurement but required for
 `trackPurchaseObserved` and ChatGPT Ads conversion reporting, because an unsigned bearer-token
 request must never control an ads conversion. For a cold launch from a ChatGPT ad, call the
 context overload of `handleDeepLink` before `configure`: the bounded `oppref` is included in the

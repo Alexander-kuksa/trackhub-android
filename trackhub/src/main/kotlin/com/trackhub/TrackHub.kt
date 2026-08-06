@@ -1,5 +1,6 @@
 package com.trackhub
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.Application
 import android.content.Context
@@ -15,6 +16,7 @@ import com.android.installreferrer.api.InstallReferrerClient
 import com.android.installreferrer.api.InstallReferrerStateListener
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
@@ -28,6 +30,9 @@ import java.util.TimeZone
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.min
+import kotlin.random.Random
 
 data class TrackHubAttribution(
     val revision: String,
@@ -91,6 +96,10 @@ enum class TrackHubSalesEvent(val value: String) {
  * )
  * ```
  */
+// Queue and privacy mutations deliberately use commit() on the dedicated `io`
+// executor: returning from those state transitions before the bytes are durable
+// would reintroduce event loss or incomplete erasure after a process crash.
+@SuppressLint("ApplySharedPref")
 object TrackHub {
 
     /** SDK version reported to the platform for integration detection. */
@@ -127,7 +136,19 @@ object TrackHub {
     private const val ADS_MEASUREMENT_CONSENT_KEY = "consent_ads_measurement"
     private const val SESSION_TIMEOUT_MS = 60_000L
     private const val MAX_PENDING_REPORTS = 1000
+    private const val MAX_PENDING_BYTES = 4 * 1024 * 1024
+    private const val MAX_REPORT_BYTES = 64 * 1024
+    private const val MAX_RESPONSE_BYTES = 64 * 1024
+    private const val CALLBACK_TIMEOUT_MS = 15_000L
+    private const val RETRY_BASE_MS = 1_000L
+    private const val RETRY_MAX_MS = 5 * 60_000L
     private val io = Executors.newSingleThreadExecutor()
+    // Network work must never occupy the state/persistence executor. New
+    // events are durably spooled by `io` while this single delivery worker is
+    // waiting on an unavailable TrackHub endpoint.
+    private val delivery = Executors.newSingleThreadExecutor()
+    private val auxiliaryNetwork = Executors.newFixedThreadPool(2)
+    private val watchdog = Executors.newSingleThreadScheduledExecutor()
 
     @Volatile private var endpoint: String? = null
     @Volatile private var ingestToken: String? = null
@@ -152,7 +173,27 @@ object TrackHub {
     @Volatile private var attributionFetchInFlight = false
     @Volatile private var deferredResolveInFlight = false
     @Volatile private var trackingDisabled = false
+    // Accessed only from `io`.
+    private var deliveryInFlight = false
+    private var retryGeneration = 0L
+    private var retryScheduledAtMs = 0L
+    private var transientRetryNotBeforeMs = 0L
     private var startedActivities = 0
+
+    private data class NetworkConfig(
+        val endpoint: String,
+        val ingestToken: String,
+        val sdkSecret: String?,
+    )
+
+    private data class PendingDelivery(
+        val id: String,
+        val path: String,
+        val body: String,
+        val kind: String?,
+        val attempts: Int,
+        val nextAttemptAtMs: Long,
+    )
 
     internal fun isAllowedEndpoint(value: String): Boolean {
         if (value != value.trim()) return false
@@ -259,7 +300,12 @@ object TrackHub {
         trackingDisabled = false
         firstOpenAt(configuredAppContext)
         registerLifecycle(configuredAppContext)
-        apphudCollectDeviceIdentifiersHandler?.let { handler -> runOnMain { handler() } }
+        apphudCollectDeviceIdentifiersHandler?.let { handler ->
+            runOnMain {
+                runCatching { handler() }
+                    .onFailure { log("Apphud device-identifier handler failed") }
+            }
+        }
         io.execute {
             reportInstallIfNeeded(configuredAppContext)
             reportPushTokenIfAvailable(configuredAppContext)
@@ -374,7 +420,7 @@ object TrackHub {
     @JvmStatic
     fun getAttribution(completion: (TrackHubAttribution?) -> Unit) {
         currentAttribution?.let { current ->
-            runOnMain { completion(current) }
+            runOnMainSafely("attribution completion") { completion(current) }
             return
         }
         io.execute { fetchAttributionIfNeeded(completion) }
@@ -406,40 +452,59 @@ object TrackHub {
             val handler = backendPrivacyErasureHandler
             if (context == null || uid.isNullOrBlank() || token == null || handler == null) {
                 log("forget-device requires backendPrivacyErasureHandler")
-                completion?.let { callback -> runOnMain { callback(false) } }
+                completion?.let { callback ->
+                    runOnMainSafely("forget-device completion") { callback(false) }
+                }
                 return@execute
             }
-            runOnMain {
-                handler(uid, reason.take(256)) { accepted ->
-                    io.execute {
-                        if (accepted) {
-                            trackingDisabled = true
-                            currentAttribution = null
-                            val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                            prefs.edit()
-                                .putBoolean(PRIVACY_DISABLED_PREFIX + hashKey(token), true)
-                                .remove(pendingReportsKey())
-                                .remove(PUSH_TOKEN_KEY)
-                                .remove(ADVERTISING_ID_KEY)
-                                .remove(APP_SET_ID_KEY)
-                                .remove(PENDING_GCLID_KEY)
-                                .remove(PENDING_GBRAID_KEY)
-                                .remove(GCLID_KEY)
-                                .remove(GBRAID_KEY)
-                                .remove(OPENAI_OPPREF_KEY)
-                                .remove(PENDING_OPENAI_OPPREF_KEY)
-                                .remove(DEFERRED_MATCH_TOKEN_KEY)
-                                .remove(DEVICE_ID_KEY)
-                                .remove(INSTALL_UID_KEY)
-                                .apply()
-                            pendingGclid = null
-                            pendingGbraid = null
-                            pendingOpenAiOppref = null
-                            userId = null
-                            firebaseAppInstanceId = null
-                        }
-                        completion?.let { callback -> runOnMain { callback(accepted) } }
+            val finished = AtomicBoolean(false)
+            fun finish(accepted: Boolean) {
+                if (!finished.compareAndSet(false, true)) return
+                io.execute {
+                    if (accepted) {
+                        trackingDisabled = true
+                        currentAttribution = null
+                        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                        prefs.edit()
+                            .putBoolean(PRIVACY_DISABLED_PREFIX + hashKey(token), true)
+                            .remove(pendingReportsKey())
+                            .remove(PUSH_TOKEN_KEY)
+                            .remove(ADVERTISING_ID_KEY)
+                            .remove(APP_SET_ID_KEY)
+                            .remove(PENDING_GCLID_KEY)
+                            .remove(PENDING_GBRAID_KEY)
+                            .remove(GCLID_KEY)
+                            .remove(GBRAID_KEY)
+                            .remove(OPENAI_OPPREF_KEY)
+                            .remove(PENDING_OPENAI_OPPREF_KEY)
+                            .remove(DEFERRED_MATCH_TOKEN_KEY)
+                            .remove(DEVICE_ID_KEY)
+                            .remove(INSTALL_UID_KEY)
+                            .commit()
+                        pendingGclid = null
+                        pendingGbraid = null
+                        pendingOpenAiOppref = null
+                        userId = null
+                        firebaseAppInstanceId = null
                     }
+                    completion?.let { callback ->
+                        runOnMain {
+                            runCatching { callback(accepted) }
+                                .onFailure { log("forget-device completion failed") }
+                        }
+                    }
+                }
+            }
+            watchdog.schedule({
+                log("forget-device backend timed out")
+                finish(false)
+            }, CALLBACK_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            runOnMain {
+                runCatching {
+                    handler(uid, reason.take(256)) { accepted -> finish(accepted) }
+                }.onFailure {
+                    log("forget-device backend handler failed")
+                    finish(false)
                 }
             }
         }
@@ -459,14 +524,25 @@ object TrackHub {
         if (name.isBlank()) return
         val context = appContext ?: return log("trackEvent before configure — skipped")
         val uid = userId ?: return log("trackEvent before configure — skipped")
-        val body = deviceContextBody(context)
-            .put("client_event_id", UUID.randomUUID().toString())
-            .put("event_name", name)
-            .put("user_id", uid)
-            .put("occurred_at", iso8601(Date()))
-        if (callbackParams.isNotEmpty()) body.put("callback_params", JSONObject(callbackParams))
-        if (partnerParams.isNotEmpty()) body.put("partner_params", JSONObject(partnerParams))
-        io.execute { sendOrQueue("sdk/track", body.toString()) }
+        val rawBody = runCatching {
+            val body = deviceContextBody(context)
+                .put("client_event_id", UUID.randomUUID().toString())
+                .put("event_name", name)
+                .put("user_id", uid)
+                .put("occurred_at", iso8601(Date()))
+            if (callbackParams.isNotEmpty()) body.put("callback_params", JSONObject(callbackParams))
+            if (partnerParams.isNotEmpty()) body.put("partner_params", JSONObject(partnerParams))
+            body.toString()
+        }.getOrNull()
+        if (rawBody == null) {
+            log("trackEvent payload is not JSON-serializable — skipped")
+            return
+        }
+        if (rawBody.toByteArray(Charsets.UTF_8).size > MAX_REPORT_BYTES) {
+            log("trackEvent payload exceeds ${MAX_REPORT_BYTES} bytes — skipped")
+            return
+        }
+        io.execute { sendOrQueue("sdk/track", rawBody) }
     }
 
     /** Canonical subscription-funnel event with placement as a parameter. */
@@ -526,9 +602,21 @@ object TrackHub {
             pendingOpenAiOppref = null
             return false
         }
-        val gclid = uri.getQueryParameter("gclid")?.takeIf { it.isNotEmpty() }
-        val gbraid = uri.getQueryParameter("gbraid")?.takeIf { it.isNotEmpty() }
-        val oppref = normalizedOpenAiOppref(uri.getQueryParameter("oppref"))
+        // Android throws UnsupportedOperationException when query parameters
+        // are read from opaque URIs such as mailto:. Deep-link handling is a
+        // public SDK boundary and must always fail open for the host app.
+        if (!uri.isHierarchical) return false
+        val parameters = runCatching {
+            Triple(
+                uri.getQueryParameter("gclid")?.takeIf { it.isNotEmpty() },
+                uri.getQueryParameter("gbraid")?.takeIf { it.isNotEmpty() },
+                normalizedOpenAiOppref(uri.getQueryParameter("oppref")),
+            )
+        }.getOrElse {
+            log("unsupported deep link — skipped")
+            return false
+        }
+        val (gclid, gbraid, oppref) = parameters
         if (gclid == null && gbraid == null && oppref == null) return false
         pendingGclid = gclid
         pendingGbraid = gbraid
@@ -637,22 +725,28 @@ object TrackHub {
         if (integrationTestToken == null && prefs.getBoolean(INSTALL_SENT_KEY, false)) return
 
         val client = InstallReferrerClient.newBuilder(context).build()
-        client.startConnection(object : InstallReferrerStateListener {
-            override fun onInstallReferrerSetupFinished(responseCode: Int) {
-                val referrer = runCatching {
-                    if (responseCode == InstallReferrerClient.InstallReferrerResponse.OK) {
-                        client.installReferrer.installReferrer
-                    } else null
-                }.getOrNull()
-                runCatching { client.endConnection() }
-                io.execute { sendInstall(context, prefs, referrer) }
-            }
+        runCatching {
+            client.startConnection(object : InstallReferrerStateListener {
+                override fun onInstallReferrerSetupFinished(responseCode: Int) {
+                    val referrer = runCatching {
+                        if (responseCode == InstallReferrerClient.InstallReferrerResponse.OK) {
+                            client.installReferrer.installReferrer
+                        } else null
+                    }.getOrNull()
+                    runCatching { client.endConnection() }
+                    io.execute { sendInstall(context, prefs, referrer) }
+                }
 
-            override fun onInstallReferrerServiceDisconnected() {
-                // referrer unavailable — still report the install (organic)
-                io.execute { sendInstall(context, prefs, null) }
-            }
-        })
+                override fun onInstallReferrerServiceDisconnected() {
+                    // referrer unavailable — still report the install (organic)
+                    io.execute { sendInstall(context, prefs, null) }
+                }
+            })
+        }.onFailure {
+            runCatching { client.endConnection() }
+            log("Install Referrer unavailable — reporting organic install")
+            io.execute { sendInstall(context, prefs, null) }
+        }
     }
 
     private fun sendInstall(context: Context, prefs: android.content.SharedPreferences, referrer: String?) {
@@ -683,17 +777,13 @@ object TrackHub {
         firebaseAppInstanceId?.takeIf { it.isNotEmpty() }?.let { body.put("app_instance_id", it) }
         appendConsent(prefs, body)
 
-        val code = post("install", withIntegrationTestToken(body.toString()))
-        if (code in 200..299) {
-            if (integrationTestToken == null) prefs.edit().putBoolean(INSTALL_SENT_KEY, true).apply()
-            log(if (integrationTestToken == null) "install reported" else "integration-test install reported")
-            if (integrationTestToken == null) {
-                sendConsentUpdate(context)
-                fetchAttributionIfNeeded()
-            }
-        } else {
-            log("install report failed — will retry on next launch")
-        }
+        val production = integrationTestToken == null
+        sendOrQueue(
+            path = "install",
+            rawBody = body.toString(),
+            kind = if (production) "production_install" else "test_install",
+            dedupeKey = "install",
+        )
         if (integrationTestToken == null) resolveDeferredDeepLinkIfNeeded()
     }
 
@@ -814,31 +904,56 @@ object TrackHub {
 
     private fun fetchAttributionIfNeeded(completion: ((TrackHubAttribution?) -> Unit)? = null) {
         if (trackingDisabled || attributionFetchInFlight || integrationTestToken != null) {
-            completion?.let { callback -> runOnMain { callback(null) } }
+            completion?.let { callback ->
+                runOnMainSafely("attribution completion") { callback(null) }
+            }
             return
         }
         val uid = userId
         val provider = backendAttributionProvider
         if (uid.isNullOrBlank() || provider == null) {
-            completion?.let { callback -> runOnMain { callback(null) } }
+            completion?.let { callback ->
+                runOnMainSafely("attribution completion") { callback(null) }
+            }
             if (provider == null) log("attribution fetch requires backendAttributionProvider")
             return
         }
         attributionFetchInFlight = true
-        runOnMain {
-            provider(uid) { raw ->
-                io.execute {
-                    attributionFetchInFlight = false
-                    val snapshot = raw?.let(::parseAttribution)
-                    if (snapshot != null) {
-                        val changed = currentAttribution?.revision != snapshot.revision
-                        currentAttribution = snapshot
-                        if (changed) attributionChangedHandler?.let { handler -> runOnMain { handler(snapshot) } }
-                        deliverAttributionToApphud(uid, snapshot)
+        val finished = AtomicBoolean(false)
+        fun finish(raw: String?) {
+            if (!finished.compareAndSet(false, true)) return
+            io.execute {
+                attributionFetchInFlight = false
+                val snapshot = raw?.let(::parseAttribution)
+                if (snapshot != null) {
+                    val changed = currentAttribution?.revision != snapshot.revision
+                    currentAttribution = snapshot
+                    if (changed) attributionChangedHandler?.let { handler ->
+                        runOnMain {
+                            runCatching { handler(snapshot) }
+                                .onFailure { log("attribution-changed handler failed") }
+                        }
                     }
-                    completion?.let { callback -> runOnMain { callback(snapshot) } }
+                    deliverAttributionToApphud(uid, snapshot)
+                }
+                completion?.let { callback ->
+                    runOnMain {
+                        runCatching { callback(snapshot) }
+                            .onFailure { log("attribution completion failed") }
+                    }
                 }
             }
+        }
+        watchdog.schedule({
+            log("backend attribution fetch timed out")
+            finish(null)
+        }, CALLBACK_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        runOnMain {
+            runCatching { provider(uid) { raw -> finish(raw) } }
+                .onFailure {
+                    log("backend attribution provider failed")
+                    finish(null)
+                }
         }
     }
 
@@ -876,9 +991,11 @@ object TrackHub {
         val key = APPHUD_ATTRIBUTION_REVISION_PREFIX + hashKey(userId)
         if (prefs.getString(key, null) == snapshot.revision) return
         runOnMain {
-            handler(snapshot.data) { accepted ->
-                if (accepted) prefs.edit().putString(key, snapshot.revision).apply()
-            }
+            runCatching {
+                handler(snapshot.data) { accepted ->
+                    if (accepted) prefs.edit().putString(key, snapshot.revision).apply()
+                }
+            }.onFailure { log("Apphud attribution handler failed") }
         }
     }
 
@@ -886,7 +1003,9 @@ object TrackHub {
         completion: TrackHubDeferredDeepLinkHandler? = null,
     ) {
         if (trackingDisabled || deferredResolveInFlight || integrationTestToken != null) {
-            completion?.let { callback -> runOnMain { callback(null) } }
+            completion?.let { callback ->
+                runOnMainSafely("deferred deep-link completion") { callback(null) }
+            }
             return
         }
         val handler = completion ?: deferredDeepLinkHandler ?: return
@@ -895,25 +1014,43 @@ object TrackHub {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val key = DEFERRED_RESOLVE_PREFIX + hashKey(token)
         if (prefs.getBoolean(key, false)) {
-            if (completion != null) runOnMain { handler(null) }
+            if (completion != null) runOnMainSafely("deferred deep-link handler") { handler(null) }
             return
         }
         val matchToken = prefs.getString(DEFERRED_MATCH_TOKEN_KEY, null)
         if (matchToken.isNullOrBlank()) {
-            if (completion != null) runOnMain { handler(null) }
+            if (completion != null) runOnMainSafely("deferred deep-link handler") { handler(null) }
             return
         }
         deferredResolveInFlight = true
         val encodedToken = URLEncoder.encode(matchToken, Charsets.UTF_8.name())
-        val (code, raw) = getForResponse("resolve?match_token=$encodedToken")
-        deferredResolveInFlight = false
-        if (code !in 200..299 || raw == null) {
-            runOnMain { handler(null) }
+        val networkConfig = currentNetworkConfig()
+        if (networkConfig == null) {
+            deferredResolveInFlight = false
+            runOnMain { runCatching { handler(null) } }
             return
         }
-        val path = runCatching { JSONObject(raw).optString("deep_link_path").takeIf { it.isNotEmpty() } }.getOrNull()
-        prefs.edit().putBoolean(key, true).remove(DEFERRED_MATCH_TOKEN_KEY).apply()
-        runOnMain { handler(path) }
+        auxiliaryNetwork.execute {
+            val (code, raw) = getForResponse(networkConfig, "resolve?match_token=$encodedToken")
+            io.execute state@{
+                deferredResolveInFlight = false
+                if (code !in 200..299 || raw == null) {
+                    runOnMain {
+                        runCatching { handler(null) }
+                            .onFailure { log("deferred deep-link handler failed") }
+                    }
+                    return@state
+                }
+                val path = runCatching {
+                    JSONObject(raw).optString("deep_link_path").takeIf { it.isNotEmpty() }
+                }.getOrNull()
+                prefs.edit().putBoolean(key, true).remove(DEFERRED_MATCH_TOKEN_KEY).apply()
+                runOnMain {
+                    runCatching { handler(path) }
+                        .onFailure { log("deferred deep-link handler failed") }
+                }
+            }
+        }
     }
 
     private fun hashKey(value: String): String =
@@ -954,35 +1091,234 @@ object TrackHub {
     private fun explicitCountryCode(prefs: android.content.SharedPreferences): String? =
         normalizedCountryCode(prefs.getString(COUNTRY_CODE_KEY, null))
 
-    private fun sendOrQueue(path: String, rawBody: String) {
+    /**
+     * Persist first, then let a single bounded delivery worker drain the queue.
+     * This method runs on `io`; a slow network can no longer prevent subsequent
+     * events from reaching durable storage.
+     */
+    private fun sendOrQueue(
+        path: String,
+        rawBody: String,
+        kind: String? = null,
+        dedupeKey: String? = null,
+    ) {
         if (trackingDisabled) return
         val context = appContext ?: return
         val preparedBody = withIntegrationTestToken(rawBody)
-        val code = post(path, preparedBody)
-        if (!isRetryable(code)) return // delivered or permanently rejected
-        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (preparedBody.toByteArray(Charsets.UTF_8).size > MAX_REPORT_BYTES) {
+            log("$path payload exceeds ${MAX_REPORT_BYTES} bytes — skipped")
+            return
+        }
         val queueKey = pendingReportsKey()
-        val items = runCatching { JSONArray(prefs.getString(queueKey, "[]")) }
-            .getOrElse { JSONArray() }
-        items.put(JSONObject().put("path", path).put("body", preparedBody))
-        while (items.length() > MAX_PENDING_REPORTS) items.remove(0)
-        prefs.edit().putString(queueKey, items.toString()).apply()
+        if (!enqueuePending(context, queueKey, path, preparedBody, kind, dedupeKey)) return
+        scheduleNextDelivery(context)
+    }
+
+    private fun enqueuePending(
+        context: Context,
+        queueKey: String,
+        path: String,
+        rawBody: String,
+        kind: String?,
+        dedupeKey: String?,
+    ): Boolean {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val items = loadPending(prefs, queueKey)
+        val now = System.currentTimeMillis()
+        var existingIndex = -1
+        if (dedupeKey != null) {
+            for (i in 0 until items.length()) {
+                if (items.optJSONObject(i)?.optString("dedupe_key") == dedupeKey) {
+                    existingIndex = i
+                    break
+                }
+            }
+        }
+        val existing = if (existingIndex >= 0) items.optJSONObject(existingIndex) else null
+        val item = JSONObject()
+            .put("id", existing?.optString("id")?.takeIf { it.isNotEmpty() } ?: UUID.randomUUID().toString())
+            .put("path", path)
+            .put("body", rawBody)
+            .put("created_at_ms", existing?.optLong("created_at_ms", now) ?: now)
+            .put("attempts", 0)
+            .put("next_attempt_at_ms", 0L)
+        if (kind != null) item.put("kind", kind)
+        if (dedupeKey != null) item.put("dedupe_key", dedupeKey)
+        if (existingIndex >= 0) items.put(existingIndex, item) else items.put(item)
+
+        trimPending(items)
+        val encoded = items.toString()
+        if (encoded.toByteArray(Charsets.UTF_8).size > MAX_PENDING_BYTES) {
+            log("offline queue could not be bounded — report skipped")
+            return false
+        }
+        if (!prefs.edit().putString(queueKey, encoded).commit()) {
+            log("offline queue write failed — report skipped")
+            return false
+        }
+        val itemId = item.getString("id")
+        for (i in 0 until items.length()) {
+            if (items.optJSONObject(i)?.optString("id") == itemId) return true
+        }
+        log("offline queue limit reached — oldest report evicted")
+        return false
+    }
+
+    private fun trimPending(items: JSONArray) {
+        while (items.length() > MAX_PENDING_REPORTS) {
+            items.remove(pendingEvictionIndex(items))
+        }
+        val sizes = mutableListOf<Int>()
+        for (i in 0 until items.length()) {
+            sizes += items.optJSONObject(i).toString().toByteArray(Charsets.UTF_8).size
+        }
+        var totalBytes = 2 + sizes.sum() + (items.length() - 1).coerceAtLeast(0)
+        while (totalBytes > MAX_PENDING_BYTES && items.length() > 0) {
+            val index = pendingEvictionIndex(items)
+            totalBytes -= sizes[index]
+            if (items.length() > 1) totalBytes -= 1
+            items.remove(index)
+            sizes.removeAt(index)
+        }
+    }
+
+    private fun pendingEvictionIndex(items: JSONArray): Int {
+        for (i in 0 until items.length()) {
+            if (items.optJSONObject(i)?.optString("kind") != "production_install") return i
+        }
+        return 0
+    }
+
+    private fun loadPending(
+        prefs: android.content.SharedPreferences,
+        queueKey: String,
+    ): JSONArray {
+        val raw = prefs.getString(queueKey, "[]") ?: "[]"
+        if (raw.toByteArray(Charsets.UTF_8).size > MAX_PENDING_BYTES * 2) {
+            log("offline queue exceeded its recovery limit — resetting")
+            prefs.edit().putString(queueKey, "[]").commit()
+            return JSONArray()
+        }
+        return runCatching { JSONArray(raw) }.getOrElse {
+            log("offline queue was corrupt — resetting")
+            prefs.edit().putString(queueKey, "[]").commit()
+            JSONArray()
+        }
     }
 
     private fun flushPending(context: Context) {
-        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        scheduleNextDelivery(context)
+    }
+
+    // On `io`. Exactly one network request is in flight process-wide.
+    private fun scheduleNextDelivery(context: Context) {
+        if (trackingDisabled || deliveryInFlight) return
         val queueKey = pendingReportsKey()
-        val items = runCatching { JSONArray(prefs.getString(queueKey, "[]")) }
-            .getOrElse { JSONArray() }
-        val keep = JSONArray()
-        for (i in 0 until items.length()) {
-            val item = items.optJSONObject(i) ?: continue
-            val path = item.optString("path")
-            val rawBody = item.optString("body")
-            val code = post(path, rawBody)
-            if (isRetryable(code)) keep.put(item)
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val items = loadPending(prefs, queueKey)
+        while (items.length() > 0) {
+            val raw = items.optJSONObject(0)
+            val path = raw?.optString("path").orEmpty()
+            val body = raw?.optString("body").orEmpty()
+            if (raw != null && path.isNotEmpty() && body.isNotEmpty()) break
+            items.remove(0)
+            prefs.edit().putString(queueKey, items.toString()).commit()
         }
-        prefs.edit().putString(queueKey, keep.toString()).apply()
+        val raw = items.optJSONObject(0) ?: return
+        val pending = PendingDelivery(
+            id = raw.optString("id").takeIf { it.isNotEmpty() } ?: UUID.randomUUID().toString(),
+            path = raw.optString("path"),
+            body = raw.optString("body"),
+            kind = raw.optString("kind").takeIf { it.isNotEmpty() },
+            attempts = raw.optInt("attempts", 0).coerceAtLeast(0),
+            nextAttemptAtMs = raw.optLong("next_attempt_at_ms", 0L).coerceAtLeast(0L),
+        )
+        if (!raw.has("id")) {
+            raw.put("id", pending.id)
+            prefs.edit().putString(queueKey, items.toString()).commit()
+        }
+        val targetAtMs = maxOf(pending.nextAttemptAtMs, transientRetryNotBeforeMs)
+        val delayMs = targetAtMs - System.currentTimeMillis()
+        if (delayMs > 0) {
+            if (retryScheduledAtMs != 0L && retryScheduledAtMs <= targetAtMs) return
+            retryGeneration += 1
+            val generation = retryGeneration
+            retryScheduledAtMs = targetAtMs
+            watchdog.schedule({
+                io.execute {
+                    if (retryGeneration != generation) return@execute
+                    retryScheduledAtMs = 0L
+                    scheduleNextDelivery(context)
+                }
+            }, delayMs, TimeUnit.MILLISECONDS)
+            return
+        }
+        retryGeneration += 1
+        retryScheduledAtMs = 0L
+        transientRetryNotBeforeMs = 0L
+        val networkConfig = currentNetworkConfig() ?: return
+        deliveryInFlight = true
+        delivery.execute {
+            val code = postForResponse(networkConfig, pending.path, pending.body).first
+            io.execute {
+                deliveryInFlight = false
+                handleDeliveryResult(context, queueKey, pending, code)
+                scheduleNextDelivery(context)
+            }
+        }
+    }
+
+    private fun handleDeliveryResult(
+        context: Context,
+        queueKey: String,
+        pending: PendingDelivery,
+        code: Int,
+    ) {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val items = loadPending(prefs, queueKey)
+        var index = -1
+        for (i in 0 until items.length()) {
+            if (items.optJSONObject(i)?.optString("id") == pending.id) {
+                index = i
+                break
+            }
+        }
+        if (index < 0) return
+        if (isRetryable(code)) {
+            val item = items.getJSONObject(index)
+            val attempts = pending.attempts + 1
+            val exponent = min(attempts - 1, 9)
+            val cap = min(RETRY_MAX_MS, RETRY_BASE_MS * (1L shl exponent))
+            val half = (cap / 2).coerceAtLeast(1L)
+            val delayMs = half + Random.nextLong(half + 1)
+            val nextAttemptAtMs = System.currentTimeMillis() + delayMs
+            item.put("attempts", attempts)
+            item.put("next_attempt_at_ms", nextAttemptAtMs)
+            // If durable storage is temporarily unavailable, retain an
+            // in-process deadline so a write failure cannot create a hot loop.
+            transientRetryNotBeforeMs = nextAttemptAtMs
+            if (!prefs.edit().putString(queueKey, items.toString()).commit()) {
+                log("${pending.path} retry state could not be persisted")
+            }
+            log("${pending.path} delivery failed — retrying with backoff")
+            return
+        }
+
+        items.remove(index)
+        prefs.edit().putString(queueKey, items.toString()).commit()
+        if (code in 200..299) {
+            when (pending.kind) {
+                "production_install" -> {
+                    prefs.edit().putBoolean(INSTALL_SENT_KEY, true).commit()
+                    log("install reported")
+                    sendConsentUpdate(context)
+                    fetchAttributionIfNeeded()
+                }
+                "test_install" -> log("integration-test install reported")
+            }
+        } else {
+            log("${pending.path} rejected with HTTP $code — not retried")
+        }
     }
 
     internal fun offlineQueueNamespace(testToken: String?): String {
@@ -991,8 +1327,8 @@ object TrackHub {
         return "test-" + digest.take(8).joinToString("") { "%02x".format(it.toInt() and 0xff) }
     }
 
-    private fun pendingReportsKey(): String {
-        val namespace = offlineQueueNamespace(integrationTestToken)
+    private fun pendingReportsKey(testToken: String? = integrationTestToken): String {
+        val namespace = offlineQueueNamespace(testToken)
         // Keep the historical production key so an SDK update does not strand
         // real reports already buffered by an older version.
         return if (namespace == "production") PENDING_REPORTS_KEY else "${PENDING_REPORTS_KEY}_$namespace"
@@ -1004,64 +1340,87 @@ object TrackHub {
             .getOrDefault(rawBody)
     }
 
-    // HTTP status, or -1 for a retryable transport failure.
-    private fun post(path: String, rawBody: String): Int {
-        return postForResponse(path, rawBody).first
+    private fun currentNetworkConfig(): NetworkConfig? {
+        val base = endpoint ?: return null
+        val token = ingestToken ?: return null
+        return NetworkConfig(base, token, sdkSecret)
     }
 
-    private fun postForResponse(path: String, rawBody: String): Pair<Int, String?> {
-        val base = endpoint ?: return -1 to null
-        val token = ingestToken ?: return -1 to null
-        return runCatching {
-            val conn = URL("$base/ingest/$token/$path").openConnection() as HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.connectTimeout = 10_000
-            conn.readTimeout = 10_000
-            conn.doOutput = true
-            conn.setRequestProperty("Content-Type", "application/json")
+    // HTTP status, or -1 for a retryable transport failure.
+    private fun postForResponse(
+        config: NetworkConfig,
+        path: String,
+        rawBody: String,
+    ): Pair<Int, String?> {
+        var conn: HttpURLConnection? = null
+        return try {
+            val connection = URL("${config.endpoint}/ingest/${config.ingestToken}/$path")
+                .openConnection() as HttpURLConnection
+            conn = connection
+            connection.requestMethod = "POST"
+            connection.connectTimeout = 10_000
+            connection.readTimeout = 10_000
+            connection.doOutput = true
+            connection.setRequestProperty("User-Agent", "TrackHub-Android/$SDK_VERSION")
+            connection.setRequestProperty("Content-Type", "application/json")
 
             // SDK Signature over the exact bytes we send
-            val secret = sdkSecret
+            val secret = config.sdkSecret
             if (!secret.isNullOrEmpty()) {
                 val ts = System.currentTimeMillis().toString()
-                conn.setRequestProperty("X-TrackHub-Timestamp", ts)
-                conn.setRequestProperty("X-TrackHub-Signature-Version", "2")
-                conn.setRequestProperty(
+                connection.setRequestProperty("X-TrackHub-Timestamp", ts)
+                connection.setRequestProperty("X-TrackHub-Signature-Version", "2")
+                connection.setRequestProperty(
                     "X-TrackHub-Signature",
-                    Signing.sign(secret, ts, token, path, rawBody),
+                    Signing.sign(secret, ts, config.ingestToken, path, rawBody),
                 )
             }
 
-            conn.outputStream.use { it.write(rawBody.toByteArray(Charsets.UTF_8)) }
-            val code = conn.responseCode
-            val response = runCatching {
-                (if (code >= 400) conn.errorStream else conn.inputStream)
-                    ?.bufferedReader(Charsets.UTF_8)
-                    ?.use { it.readText() }
-            }.getOrNull()
-            conn.disconnect()
-            code to response
-        }.getOrDefault(-1 to null)
+            connection.outputStream.use { it.write(rawBody.toByteArray(Charsets.UTF_8)) }
+            val code = connection.responseCode
+            // Delivery only needs the status. Do not buffer an untrusted or
+            // accidentally huge response body inside the host application.
+            code to null
+        } catch (_: Throwable) {
+            -1 to null
+        } finally {
+            runCatching { conn?.disconnect() }
+        }
     }
 
-    private fun getForResponse(path: String): Pair<Int, String?> {
-        val base = endpoint ?: return -1 to null
-        val token = ingestToken ?: return -1 to null
-        return runCatching {
-            val conn = URL("$base/ingest/$token/$path").openConnection() as HttpURLConnection
-            conn.requestMethod = "GET"
-            conn.connectTimeout = 10_000
-            conn.readTimeout = 10_000
-            conn.setRequestProperty("User-Agent", "TrackHub-Android/$SDK_VERSION")
-            val code = conn.responseCode
-            val response = runCatching {
-                (if (code >= 400) conn.errorStream else conn.inputStream)
-                    ?.bufferedReader(Charsets.UTF_8)
-                    ?.use { it.readText() }
-            }.getOrNull()
-            conn.disconnect()
+    private fun getForResponse(config: NetworkConfig, path: String): Pair<Int, String?> {
+        var conn: HttpURLConnection? = null
+        return try {
+            val connection = URL("${config.endpoint}/ingest/${config.ingestToken}/$path")
+                .openConnection() as HttpURLConnection
+            conn = connection
+            connection.requestMethod = "GET"
+            connection.connectTimeout = 10_000
+            connection.readTimeout = 10_000
+            connection.setRequestProperty("User-Agent", "TrackHub-Android/$SDK_VERSION")
+            val code = connection.responseCode
+            val response = readLimitedResponse(connection, code)
             code to response
-        }.getOrDefault(-1 to null)
+        } catch (_: Throwable) {
+            -1 to null
+        } finally {
+            runCatching { conn?.disconnect() }
+        }
+    }
+
+    private fun readLimitedResponse(conn: HttpURLConnection, code: Int): String? {
+        val stream = (if (code >= 400) conn.errorStream else conn.inputStream) ?: return null
+        return stream.use { input ->
+            val output = ByteArrayOutputStream()
+            val buffer = ByteArray(4096)
+            while (output.size() < MAX_RESPONSE_BYTES) {
+                val remaining = MAX_RESPONSE_BYTES - output.size()
+                val read = input.read(buffer, 0, min(buffer.size, remaining))
+                if (read <= 0) break
+                output.write(buffer, 0, read)
+            }
+            output.toString(Charsets.UTF_8.name())
+        }
     }
 
     private fun isRetryable(code: Int): Boolean =
@@ -1109,6 +1468,12 @@ object TrackHub {
     private fun runOnMain(block: () -> Unit) {
         val looper = runCatching { Looper.getMainLooper() }.getOrNull()
         if (looper == null) block() else Handler(looper).post(block)
+    }
+
+    private fun runOnMainSafely(label: String, block: () -> Unit) {
+        runOnMain {
+            runCatching(block).onFailure { log("$label failed") }
+        }
     }
 
     private fun log(message: String) {

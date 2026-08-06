@@ -32,23 +32,24 @@ class TrackHubInstrumentedTest {
         val queueKey = "pending_reports_${TrackHub.offlineQueueNamespace(testToken)}"
         val prefs = context.getSharedPreferences("trackhub", Context.MODE_PRIVATE)
         prefs.edit()
-            .remove(queueKey)
+            .clear()
             .putString("gclid", "stale_google_click")
             .putString("pending_gclid", "stale_google_click")
-            .apply()
+            .commit()
 
         val trackAttempts = AtomicInteger(0)
+        val allowTrackRecovery = AtomicBoolean(false)
         val erasureHandler: TrackHubBackendPrivacyErasureHandler = { _, _, completion ->
             completion(true)
         }
         val server = MockWebServer()
         server.dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
-                return if (request.path?.contains("/sdk/track") == true && trackAttempts.incrementAndGet() == 1) {
+                val isTrack = request.path?.contains("/sdk/track") == true
+                if (isTrack) trackAttempts.incrementAndGet()
+                return if (isTrack && !allowTrackRecovery.get()) {
                     MockResponse().setResponseCode(500).setBody("{}")
-                } else {
-                    MockResponse().setResponseCode(200).setBody("{}")
-                }
+                } else MockResponse().setResponseCode(200).setBody("{}")
             }
         }
         server.start()
@@ -60,6 +61,7 @@ class TrackHubInstrumentedTest {
                     Uri.parse("https://app.example/open?oppref=${"x".repeat(1025)}"),
                 ),
             )
+            assertFalse(TrackHub.handleDeepLink(context, Uri.parse("mailto:support@example.com")))
             assertTrue(
                 TrackHub.handleDeepLink(
                     context,
@@ -95,6 +97,7 @@ class TrackHubInstrumentedTest {
             assertNotNull(firstTrack.getHeader("X-TrackHub-Timestamp"))
             assertNotNull(firstTrack.getHeader("X-TrackHub-Signature"))
             waitUntil { JSONArray(prefs.getString(queueKey, "[]")).length() == 1 }
+            allowTrackRecovery.set(true)
 
             // Reconfigure in the same Test Lab namespace: only that queue is
             // drained, and the second dispatcher response succeeds.
@@ -109,6 +112,38 @@ class TrackHubInstrumentedTest {
             )
             waitForTrackRequest(server)
             waitUntil { JSONArray(prefs.getString(queueKey, "[]")).length() == 0 }
+
+            val outageToken = "outage-resilience-token-with-enough-entropy-5678"
+            val outageQueueKey = "pending_reports_${TrackHub.offlineQueueNamespace(outageToken)}"
+            TrackHub.configure(
+                context = context,
+                endpoint = "http://127.0.0.1:9",
+                ingestToken = "test-ingest-token-with-enough-entropy-5678",
+                userId = "outage-device-user",
+                integrationTestToken = outageToken,
+                backendPrivacyErasureHandler = { _, _, completion -> completion(true) },
+            )
+
+            // org.json rejects non-finite numbers. Invalid host-provided
+            // callback data must be dropped without escaping as an exception.
+            TrackHub.trackEvent(
+                "invalid_payload",
+                callbackParams = mapOf("invalid_number" to Double.NaN),
+            )
+
+            val startedAt = SystemClock.elapsedRealtime()
+            repeat(25) { index -> TrackHub.trackEvent("offline_$index") }
+            val enqueueCallMs = SystemClock.elapsedRealtime() - startedAt
+            assertTrue("public tracking calls blocked for ${enqueueCallMs}ms", enqueueCallMs < 2_000)
+
+            waitUntil(timeoutMs = 10_000) {
+                val items = JSONArray(prefs.getString(outageQueueKey, "[]"))
+                var trackCount = 0
+                for (i in 0 until items.length()) {
+                    if (items.optJSONObject(i)?.optString("path") == "sdk/track") trackCount++
+                }
+                trackCount >= 25
+            }
 
             val forgotten = AtomicBoolean(false)
             val forgetCompleted = CountDownLatch(1)
@@ -136,7 +171,7 @@ class TrackHubInstrumentedTest {
             assertFalse(permissions.contains("com.google.android.gms.permission.AD_ID"))
             assertTrue(permissions.contains("android.permission.INTERNET"))
         } finally {
-            prefs.edit().clear().apply()
+            prefs.edit().clear().commit()
             server.shutdown()
         }
     }
@@ -164,8 +199,8 @@ class TrackHubInstrumentedTest {
         throw AssertionError("TrackHub did not send /sdk/track")
     }
 
-    private fun waitUntil(condition: () -> Boolean) {
-        val deadline = SystemClock.elapsedRealtime() + 5_000
+    private fun waitUntil(timeoutMs: Long = 5_000, condition: () -> Boolean) {
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
         while (SystemClock.elapsedRealtime() < deadline) {
             if (condition()) return
             SystemClock.sleep(25)
