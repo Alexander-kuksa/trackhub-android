@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.SystemClock
+import android.util.Base64
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import okhttp3.mockwebserver.Dispatcher
@@ -38,9 +39,6 @@ class TrackHubInstrumentedTest {
 
         val trackAttempts = AtomicInteger(0)
         val allowTrackRecovery = AtomicBoolean(false)
-        val erasureHandler: TrackHubBackendPrivacyErasureHandler = { _, _, completion ->
-            completion(true)
-        }
         val server = MockWebServer()
         server.dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
@@ -67,18 +65,21 @@ class TrackHubInstrumentedTest {
                     Uri.parse("https://app.example/open?oppref=chatgpt-click-123"),
                 ),
             )
-            assertFalse(prefs.contains("gclid"))
-            assertFalse(prefs.contains("pending_gclid"))
+            // Persistence is intentionally off-main-thread to avoid parsing or
+            // rewriting SharedPreferences XML in a host lifecycle callback.
+            waitUntil { !prefs.contains("gclid") && !prefs.contains("pending_gclid") }
 
-            TrackHub.configure(
-                context = context,
-                endpoint = endpoint,
-                ingestToken = "test-ingest-token-with-enough-entropy-1234",
-                userId = "qa-device-user",
-                sdkSecret = "test-sdk-secret",
-                debug = true,
-                integrationTestToken = testToken,
-                backendPrivacyErasureHandler = erasureHandler,
+            TrackHub.start(
+                context,
+                TrackHubConfig(
+                    sdkKey = sdkKey(
+                        endpoint,
+                        "test-ingest-token-with-enough-entropy-1234",
+                        "test-sdk-secret-with-enough-entropy",
+                    ),
+                    environment = TrackHubEnvironment.TestLab(testToken),
+                    debugLogging = true,
+                ),
             )
 
             val opprefPayloads = waitForOpprefPayloads(server)
@@ -101,28 +102,31 @@ class TrackHubInstrumentedTest {
 
             // Reconfigure in the same Test Lab namespace: only that queue is
             // drained, and the second dispatcher response succeeds.
-            TrackHub.configure(
-                context = context,
-                endpoint = endpoint,
-                ingestToken = "test-ingest-token-with-enough-entropy-1234",
-                userId = "qa-device-user",
-                sdkSecret = "test-sdk-secret",
-                debug = true,
-                integrationTestToken = testToken,
-                backendPrivacyErasureHandler = erasureHandler,
+            TrackHub.start(
+                context,
+                TrackHubConfig(
+                    sdkKey = sdkKey(
+                        endpoint,
+                        "test-ingest-token-with-enough-entropy-1234",
+                        "test-sdk-secret-with-enough-entropy",
+                    ),
+                    environment = TrackHubEnvironment.TestLab(testToken),
+                    debugLogging = true,
+                ),
             )
             waitForTrackRequest(server)
             waitUntil { TrackHub.offlineQueueCount(context, testToken) == 0 }
 
             val outageToken = "outage-resilience-token-with-enough-entropy-5678"
+            val outageIngestToken = "test-ingest-token-with-enough-entropy-5678"
+            val outageSecret = "test-sdk-secret-with-enough-entropy-5678"
             TrackHub.clearOfflineQueueForTest(context, outageToken)
-            TrackHub.configure(
-                context = context,
-                endpoint = "http://127.0.0.1:9",
-                ingestToken = "test-ingest-token-with-enough-entropy-5678",
-                userId = "outage-device-user",
-                integrationTestToken = outageToken,
-                backendPrivacyErasureHandler = { _, _, completion -> completion(true) },
+            TrackHub.start(
+                context,
+                TrackHubConfig(
+                    sdkKey = sdkKey("http://127.0.0.1:9", outageIngestToken, outageSecret),
+                    environment = TrackHubEnvironment.TestLab(outageToken),
+                ),
             )
 
             // org.json rejects non-finite numbers. Invalid host-provided
@@ -141,16 +145,30 @@ class TrackHubInstrumentedTest {
                 TrackHub.offlineQueuePathCount(context, outageToken, "sdk/track") >= 25
             }
 
+            // Exercise the start()/privacy race with a brand-new namespace:
+            // gdprForgetMe must bind to this key even before startOnIo runs.
+            val privacyIngestToken = "privacy-ingest-token-with-enough-entropy-9012"
+            val privacySecret = "privacy-sdk-secret-with-enough-entropy-9012"
+            TrackHub.start(
+                context,
+                TrackHubConfig(
+                    sdkKey = sdkKey("http://127.0.0.1:9", privacyIngestToken, privacySecret),
+                    environment = TrackHubEnvironment.TestLab(outageToken),
+                ),
+            )
             val forgotten = AtomicBoolean(false)
             val forgetCompleted = CountDownLatch(1)
-            TrackHub.forgetDevice { accepted ->
+            TrackHub.gdprForgetMe { accepted ->
                 forgotten.set(accepted)
                 forgetCompleted.countDown()
             }
-            assertTrue(forgetCompleted.await(5, TimeUnit.SECONDS))
-            assertTrue(forgotten.get())
-            assertFalse(prefs.contains("openai_oppref"))
-            assertFalse(prefs.contains("pending_openai_oppref"))
+            waitUntil { TrackHub.hasPendingErasureForTest(context, privacyIngestToken) }
+            assertTrue(TrackHub.isTrackingStoppedForTest())
+            waitUntil {
+                TrackHub.offlineQueuePathCount(context, outageToken, "sdk/track") == 0 &&
+                    !prefs.contains("openai_oppref") &&
+                    !prefs.contains("pending_openai_oppref")
+            }
             assertFalse(
                 TrackHub.handleDeepLink(
                     context,
@@ -158,6 +176,20 @@ class TrackHubInstrumentedTest {
                 ),
             )
             assertFalse(prefs.contains("openai_oppref"))
+
+            // The same durable erasure resumes after a later launch against a
+            // healthy TrackHub server; tracking never turns back on meanwhile.
+            TrackHub.start(
+                context,
+                TrackHubConfig(
+                    sdkKey = sdkKey(endpoint, privacyIngestToken, privacySecret),
+                    environment = TrackHubEnvironment.TestLab(outageToken),
+                ),
+            )
+            assertTrue(forgetCompleted.await(10, TimeUnit.SECONDS))
+            assertTrue(forgotten.get())
+            assertFalse(TrackHub.hasPendingErasureForTest(context, privacyIngestToken))
+            assertTrue(TrackHub.isTrackingStoppedForTest())
 
             val permissions = context.packageManager
                 .getPackageInfo(context.packageName, PackageManager.GET_PERMISSIONS)
@@ -171,6 +203,14 @@ class TrackHubInstrumentedTest {
             prefs.edit().clear().commit()
             server.shutdown()
         }
+    }
+
+    private fun sdkKey(endpoint: String, ingestToken: String, sdkSecret: String): String {
+        val raw = JSONObject(mapOf("e" to endpoint, "i" to ingestToken, "s" to sdkSecret)).toString()
+        return "thcfg_v1_" + Base64.encodeToString(
+            raw.toByteArray(Charsets.UTF_8),
+            Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING,
+        )
     }
 
     private fun waitForOpprefPayloads(server: MockWebServer): Map<String, JSONObject> {
