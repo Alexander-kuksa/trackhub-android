@@ -58,9 +58,11 @@ dependencies {
 publishing {
     publications {
         create<MavenPublication>("release") {
-            groupId = "com.trackhub"
+            // JitPack supplies these properties for the requested Git tag.
+            // Local publishing keeps stable TrackHub defaults.
+            groupId = providers.gradleProperty("group").orElse("com.trackhub").get()
             artifactId = "trackhub-android"
-            version = "2.0.0"
+            version = providers.gradleProperty("version").orElse("2.0.1").get()
             afterEvaluate { from(components["release"]) }
         }
     }
