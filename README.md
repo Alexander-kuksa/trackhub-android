@@ -1,8 +1,10 @@
 # TrackHub Android SDK
 
 > **Текущая версия:** `1.6.2` · **minSdk:** 21 · **compileSdk:** 34 ·
-> **проверено:** 7 августа 2026 г. Полная документация платформы:
-> [`docs/README.md`](../docs/README.md); wire-контракт: [`docs/SDK_CONTRACT.md`](../docs/SDK_CONTRACT.md).
+> **проверено:** 7 августа 2026 г.
+> **Пошаговое внедрение:** [`INTEGRATION.md`](INTEGRATION.md).
+> Полная документация платформы: [TrackHub docs](https://github.com/Alexander-kuksa/trackhub/blob/main/docs/README.md);
+> wire-контракт: [SDK_CONTRACT.md](https://github.com/Alexander-kuksa/trackhub/blob/main/docs/SDK_CONTRACT.md).
 
 Kotlin SDK for TrackHub: install/referrer attribution, automatic app sessions, custom engagement
 events and the App Conversion purchase bridge. Revenue stays authoritative in Apphud/S2S; the SDK
