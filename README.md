@@ -1,7 +1,7 @@
 # TrackHub Android SDK
 
-> **Текущая версия:** `1.6.1` · **minSdk:** 21 · **compileSdk:** 34 ·
-> **проверено:** 6 августа 2026 г. Полная документация платформы:
+> **Текущая версия:** `1.6.2` · **minSdk:** 21 · **compileSdk:** 34 ·
+> **проверено:** 7 августа 2026 г. Полная документация платформы:
 > [`docs/README.md`](../docs/README.md); wire-контракт: [`docs/SDK_CONTRACT.md`](../docs/SDK_CONTRACT.md).
 
 Kotlin SDK for TrackHub: install/referrer attribution, automatic app sessions, custom engagement
@@ -54,11 +54,11 @@ dependencyResolutionManagement {
 }
 
 // app/build.gradle.kts
-implementation("com.github.Alexander-kuksa:trackhub-android:1.6.1")
+implementation("com.github.Alexander-kuksa:trackhub-android:1.6.2")
 ```
 
-(Requires a `1.6.1` git tag on the repo. Alternatively publish to GitHub Packages with
-`./gradlew :trackhub:publish` and consume `com.trackhub:trackhub-android:1.6.1`.)
+(Requires a `1.6.2` git tag on the repo. Alternatively publish to GitHub Packages with
+`./gradlew :trackhub:publish` and consume `com.trackhub:trackhub-android:1.6.2`.)
 
 The Play Install Referrer Library is pulled in transitively.
 
@@ -154,7 +154,10 @@ purchase.orderId?.let { orderId ->
 TrackHub.handleDeepLink(applicationContext, intent.data!!)
 ```
 
-`configure` reports the install once, starts automatic foreground session tracking and flushes the
+`configure` is non-blocking: all preference reads and legacy-queue migration run on the serial IO
+executor, never on the host application's main thread. A `trackEvent` or `trackPurchaseObserved`
+call made immediately after `configure` is ordered behind initialization on that same executor and
+is not lost. `configure` reports the install once, starts automatic foreground session tracking and flushes the
 bounded offline queue. Every install/session/event is committed to that queue before network delivery;
 one worker drains it with timeouts and bounded backoff, so a TrackHub outage cannot block SDK state or
 fan out requests inside the host app. `sdkSecret` is optional for ordinary measurement but required for
@@ -170,8 +173,10 @@ S2S connection's `X-TrackHub-Token`, and returns only the raw attribution respon
 flag; the S2S token must never reach the app.
 
 TrackHub-owned Google Play links add an opaque `trackhub_match_token` to Install Referrer. The SDK
-returns that token once to `/resolve`, consumes it after a successful response and never uses IP or
-User-Agent matching to retrieve a private deferred path.
+returns that token once to `/resolve` only after the durable install has received a successful
+server acknowledgement, consumes it after a successful response and never uses IP or User-Agent
+matching to retrieve a private deferred path. An explicit early resolve request is remembered and
+released after that acknowledgement, so it cannot consume attribution before install matching.
 
 Uninstall measurement additionally requires an FCM connection linked to the app in TrackHub.
 The SDK persists the latest FCM token and re-sends it after every `configure`; the server counts an
@@ -184,7 +189,7 @@ When an SDK event is explicitly mapped to a Google App Conversion custom event, 
 
 Сбой или недоступность TrackHub не должны приводить к падению host app. Все сетевые ошибки перехватываются,
 state/persistence и delivery работают на разных последовательных executors, а host callbacks
-ограничены watchdog. Точные пределы версии `1.6.1`:
+ограничены watchdog. Точные пределы версии `1.6.2`:
 
 | Механизм | Гарантия |
 |---|---|
@@ -195,12 +200,13 @@ state/persistence и delivery работают на разных последо�
 | Файловая гонка | Чтение, запись, backup-restore и privacy-delete одной очереди сериализованы общим lock; диагностический read не может восстановить устаревший `.bak` поверх нового commit |
 | Таймауты | Connect/read по 10 секунд; общее чтение GET до 15 секунд и 64 KiB (защита от slow response) |
 | Повторы | Transport failure, HTTP `408`, `429`, `5xx`; exponential backoff+jitter от 0,5 секунды до 5 минут |
+| Clock skew | `401 clock_skew` с разумным server time корректирует только process-local время подписи; report сохраняется и повторяется |
 | Без повторов | Остальные `4xx` удаляются как постоянная ошибка контракта |
 | Install | `INSTALL_SENT_KEY` записывается только после HTTP `2xx`; неподтверждённый install переживает перезапуск |
 | Host callbacks | Watchdog 15 секунд; зависший Apphud/backend callback не удерживает SDK бесконечно |
 | Privacy erase | Успешный `forgetDevice` очищает очередь и постоянно блокирует tracking для этого app token |
 
-При первом запуске `1.6.1` старая очередь из `SharedPreferences` (SDK ≤ `1.6.0`)
+При первом запуске `1.6.1+` старая очередь из `SharedPreferences` (SDK ≤ `1.6.0`)
 атомарно переносится в файл. Legacy-значение удаляется только после успешного
 commit. Повреждённый/превышающий recovery-limit файл переименовывается в
 `*.corrupt-<timestamp>`, а не затирается молча. Одноразовые click refs стираются только
@@ -246,7 +252,7 @@ no certificate pinning by default (ATS-equivalent TLS applies); add pinning via
 
 Перед production release:
 
-1. Закрепите зависимость на tag `1.6.1`; не используйте moving branch или `-SNAPSHOT`.
+1. Закрепите зависимость на tag `1.6.2`; не используйте moving branch или `-SNAPSHOT`.
 2. Запустите unit, lint, release AAR и API 34 instrumentation команды из начала документа.
 3. Соберите приложение-потребитель и проверьте, что merge manifest не добавил `AD_ID`, если
    `collectAdvertisingId=false`.
