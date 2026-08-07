@@ -174,6 +174,10 @@ object TrackHubBootstrap {
 
 `AppBackend`, `ApphudBridge`, `ConsentStore`, `MeasurementCountry` и `AppRouter` — компоненты host
 app, не классы TrackHub SDK. Их названия в примере намеренно описательные.
+Оба backend callback опциональны. Без них install/session/event и Google/OpenAI
+conversions продолжают работать. `backendAttributionProvider` нужен только для
+attribution reads/моста в Apphud, а `backendPrivacyErasureHandler` — только если
+приложение вызывает `forgetDevice`.
 
 Если приложение вызывает `configure` повторно, SDK остаётся безопасной. Тем не менее держите
 конфигурацию в одном bootstrap-компоненте, чтобы callbacks и credentials имели очевидное место
@@ -375,6 +379,16 @@ object AppBackend {
     }
 }
 ```
+
+`AppBackend` здесь — placeholder вашего кода, а не тип из TrackHub,
+Apphud или Adjust. Это не Adjust API «один в один»: Adjust SDK сам получает
+attribution через listener/getter, а privacy erasure запускается прямым
+`Adjust.gdprForgetMe(context)`. Host-backend callback и TrackHub-подобного `Bool`
+после подтверждённого server `2xx` у Adjust нет.
+
+Официальные источники: [Adjust Android attribution](https://dev.adjust.com/en/sdk/android/features/attribution/),
+[Adjust Android privacy](https://dev.adjust.com/en/sdk/android/features/privacy/),
+[Apphud Adjust integration](https://docs.apphud.com/docs/adjust).
 
 SDK вызывает host handlers на main thread и ограничивает зависший callback watchdog в 15 секунд.
 Не выполняйте blocking network call внутри handler.

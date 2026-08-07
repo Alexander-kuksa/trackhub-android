@@ -102,8 +102,7 @@ TrackHub.setGoogleAdsConsent(
 // )
 
 // On app launch (Application.onCreate), after Apphud starts.
-// Copy the app values from TrackHub → SDK integration. AppBackend below is
-// your authenticated API; it keeps the TrackHub S2S secret off the device.
+// Copy the app values from TrackHub → Setup → SDK integration.
 TrackHub.configure(
     context = applicationContext,
     endpoint = "https://postbacks.daively.com", // your ingest domain
@@ -115,23 +114,14 @@ TrackHub.configure(
     apphudCollectDeviceIdentifiersHandler = {
         Apphud.collectDeviceIdentifiers()
     },
-    backendAttributionProvider = { userId, completion ->
-        AppBackend.fetchTrackHubAttribution(userId, completion)
-    },
-    backendPrivacyErasureHandler = { userId, reason, completion ->
-        AppBackend.eraseTrackHubUser(userId, reason, completion)
-    },
-    apphudAttributionHandler = { data, completion ->
-        // Adapt `data` to Apphud's custom-attribution API in the host app.
-        sendTrackHubAttributionToApphud(data, completion)
-    },
-    attributionChangedHandler = { attribution ->
-        updateAttributionUi(attribution)
-    },
     deferredDeepLinkHandler = { path ->
         path?.let(::routeDeferredPath)
     }
 )
+
+// Optional attribution reads/Apphud attribution bridge and forgetDevice need
+// host-backend callbacks. Add them only from INTEGRATION.md; AppBackend there is
+// your code, not an SDK class.
 
 // In your FirebaseMessagingService. TrackHub does not initialize Firebase or
 // request Android 13 notification permission; it only forwards this host-owned
@@ -173,6 +163,13 @@ privacy-erasure flows. Attribution and erasure fail closed unless the correspond
 callback is supplied. That backend authenticates the signed-in user, calls TrackHub with a linked
 S2S connection's `X-TrackHub-Token`, and returns only the raw attribution response or success
 flag; the S2S token must never reach the app.
+
+Both backend callbacks are optional. Without them, ordinary install/session/event and
+Google/OpenAI conversion measurement continues. `AppBackend` is placeholder host-app code, not a
+class supplied by TrackHub, Apphud or Adjust. This is not Adjust's API shape: Adjust obtains
+attribution directly through its SDK listener/getter, while erasure uses the direct SDK call
+`Adjust.gdprForgetMe(context)`. Apphud's Adjust listener bridge is comparable only to TrackHub's
+final `apphudAttributionHandler` step, not to these host-backend callbacks.
 
 TrackHub-owned Google Play links add an opaque `trackhub_match_token` to Install Referrer. The SDK
 returns that token once to `/resolve` only after the durable install has received a successful
