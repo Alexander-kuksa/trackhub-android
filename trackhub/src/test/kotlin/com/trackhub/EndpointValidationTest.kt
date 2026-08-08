@@ -8,6 +8,14 @@ import org.junit.Test
 
 class EndpointValidationTest {
     @Test
+    fun recognizesOnlyExplicitServerPrivacyStops() {
+        assertTrue(TrackHub.isServerPrivacyStop("{\"error\":\"device_erased\"}"))
+        assertTrue(TrackHub.isServerPrivacyStop("{\"error\":\"privacy_erased\"}"))
+        assertFalse(TrackHub.isServerPrivacyStop("{\"error\":\"invalid_signature\"}"))
+        assertFalse(TrackHub.isServerPrivacyStop("not-json"))
+    }
+
+    @Test
     fun acceptsHttpsAndExactLoopbackHttp() {
         assertTrue(TrackHub.isAllowedEndpoint("https://postbacks.example.com"))
         assertTrue(TrackHub.isAllowedEndpoint("https://postbacks.example.com/base"))

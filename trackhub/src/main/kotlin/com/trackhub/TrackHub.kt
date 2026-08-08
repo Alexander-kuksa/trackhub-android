@@ -96,7 +96,7 @@ enum class TrackHubSalesEvent(val value: String) {
 object TrackHub {
 
     /** SDK version reported to the platform for integration detection. */
-    const val SDK_VERSION = "2.0.2"
+    const val SDK_VERSION = "2.0.3"
 
     private const val PREFS = "trackhub"
     private const val INSTALL_SENT_KEY = "install_sent"
@@ -149,6 +149,9 @@ object TrackHub {
     private val delivery = Executors.newSingleThreadExecutor()
     private val auxiliaryNetwork = Executors.newFixedThreadPool(2)
     private val watchdog = Executors.newSingleThreadScheduledExecutor()
+    private val privacyStateLock = Any()
+    private val privacyCallbackLock = Any()
+    private val identityStateLock = Any()
 
     @Volatile private var endpoint: String? = null
     @Volatile private var ingestToken: String? = null
@@ -179,7 +182,7 @@ object TrackHub {
     private var transientRetryNotBeforeMs = 0L
     // Corrects a bad device wall clock after the server returns its trusted
     // current time. Process-local by design; every queued request is re-signed.
-    private var clockOffsetMs = 0L
+    @Volatile private var clockOffsetMs = 0L
     private var startedActivities = 0
 
     private data class NetworkConfig(
@@ -483,11 +486,28 @@ object TrackHub {
             completion?.let { runOnMainSafely("privacy completion") { it(false) } }
             return
         }
-        pendingErasureCompletion = completion
+        addPendingErasureCompletion(completion)
         io.execute {
             clearLocalMeasurementState(configuredContext, keepInstallCredential = true)
             if (!ingestToken.isNullOrBlank()) retryPendingErasure()
         }
+    }
+
+    private fun addPendingErasureCompletion(completion: ((Boolean) -> Unit)?) {
+        if (completion == null) return
+        synchronized(privacyCallbackLock) {
+            val previous = pendingErasureCompletion
+            pendingErasureCompletion = if (previous == null) completion else { success ->
+                previous(success)
+                completion(success)
+            }
+        }
+    }
+
+    private fun takePendingErasureCompletion(): ((Boolean) -> Unit)? = synchronized(privacyCallbackLock) {
+        val completion = pendingErasureCompletion
+        pendingErasureCompletion = null
+        completion
     }
 
     /**
@@ -670,8 +690,7 @@ object TrackHub {
 
     /** Recover token-scoped SDK 2.0 jobs even after the app starts with a newly
      * rotated sdkKey. The app sandbox itself is the privacy namespace. */
-    @Synchronized
-    private fun migrateLegacyPrivacyState(context: Context) {
+    private fun migrateLegacyPrivacyState(context: Context) = synchronized(privacyStateLock) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         if (prefs.all.any { (key, value) ->
                 key.startsWith(LEGACY_PRIVACY_DISABLED_PREFIX)
@@ -714,13 +733,12 @@ object TrackHub {
         }
     }
 
-    @Synchronized
-    private fun persistPendingErasure(context: Context, job: JSONObject): Boolean {
+    private fun persistPendingErasure(context: Context, job: JSONObject): Boolean = synchronized(privacyStateLock) {
         val bytes = job.toString().toByteArray(Charsets.UTF_8)
-        if (bytes.size > 1024) return false
+        if (bytes.size > 1024) return@synchronized false
         val atomic = AtomicFile(pendingErasureFile(context))
         var output: FileOutputStream? = null
-        return try {
+        try {
             output = atomic.startWrite()
             output.write(bytes)
             output.flush()
@@ -739,8 +757,7 @@ object TrackHub {
         }
     }
 
-    @Synchronized
-    private fun loadPendingErasure(context: Context): JSONObject? {
+    private fun loadPendingErasure(context: Context): JSONObject? = synchronized(privacyStateLock) {
         val atomic = AtomicFile(pendingErasureFile(context))
         val fromFile = runCatching {
             atomic.openRead().bufferedReader(Charsets.UTF_8).use { reader ->
@@ -751,18 +768,17 @@ object TrackHub {
                 }
             }
         }.getOrNull()
-        if (fromFile != null) return fromFile
+        if (fromFile != null) return@synchronized fromFile
         val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getString(PENDING_ERASURE_KEY, null)
-            ?: return null
-        if (raw.toByteArray(Charsets.UTF_8).size > 1024) return null
-        return runCatching { JSONObject(raw) }.getOrNull()?.takeIf {
+            ?: return@synchronized null
+        if (raw.toByteArray(Charsets.UTF_8).size > 1024) return@synchronized null
+        runCatching { JSONObject(raw) }.getOrNull()?.takeIf {
             isUuid(it.optString("install_uid")) && it.optString("reason").length <= 256
         }
     }
 
-    @Synchronized
-    private fun deletePendingErasure(context: Context) {
+    private fun deletePendingErasure(context: Context) = synchronized(privacyStateLock) {
         runCatching { AtomicFile(pendingErasureFile(context)).delete() }
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .remove(PENDING_ERASURE_KEY)
@@ -862,10 +878,9 @@ object TrackHub {
                         .commit()
                     deletePendingErasure(context)
                     clearLocalMeasurementState(context, keepInstallCredential = false)
-                    pendingErasureCompletion?.let { callback ->
+                    takePendingErasureCompletion()?.let { callback ->
                         runOnMainSafely("privacy completion") { callback(true) }
                     }
-                    pendingErasureCompletion = null
                     log("device privacy erasure confirmed")
                     return@execute
                 }
@@ -987,15 +1002,34 @@ object TrackHub {
         }
 
         val client = InstallReferrerClient.newBuilder(context).build()
-        val finished = AtomicBoolean(false)
-        fun finish(referrer: String?) {
-            if (!finished.compareAndSet(false, true)) return
-            runCatching { client.endConnection() }
+        val initialSent = AtomicBoolean(false)
+        fun finishInitial(referrer: String?) {
+            if (!initialSent.compareAndSet(false, true)) return
             io.execute { sendInstall(context, prefs, referrer) }
+        }
+        fun finishFromVendor(referrer: String?) {
+            if (initialSent.compareAndSet(false, true)) {
+                io.execute { sendInstall(context, prefs, referrer) }
+            } else if (!referrer.isNullOrBlank()) {
+                // The bounded organic fallback may have fired first. Preserve a
+                // late Play response as a second, idempotent attribution signal
+                // for the same install instead of silently discarding it.
+                io.execute {
+                    sendInstall(
+                        context,
+                        prefs,
+                        referrer,
+                        dedupeKey = "install_referrer",
+                        beginSession = false,
+                    )
+                }
+            }
+            runCatching { client.endConnection() }
         }
         // Some vendor implementations neither connect nor disconnect. A
         // bounded fallback keeps the install/session queue moving as organic.
-        watchdog.schedule({ finish(null) }, 3, TimeUnit.SECONDS)
+        watchdog.schedule({ finishInitial(null) }, 3, TimeUnit.SECONDS)
+        watchdog.schedule({ runCatching { client.endConnection() } }, 30, TimeUnit.SECONDS)
         runCatching {
             client.startConnection(object : InstallReferrerStateListener {
                 override fun onInstallReferrerSetupFinished(responseCode: Int) {
@@ -1004,22 +1038,28 @@ object TrackHub {
                             client.installReferrer.installReferrer
                         } else null
                     }.getOrNull()
-                    finish(referrer)
+                    finishFromVendor(referrer)
                 }
 
                 override fun onInstallReferrerServiceDisconnected() {
                     // referrer unavailable — still report the install (organic)
-                    finish(null)
+                    finishFromVendor(null)
                 }
             })
         }.onFailure {
             log("Install Referrer unavailable — reporting organic install")
-            finish(null)
+            finishFromVendor(null)
         }
         return true
     }
 
-    private fun sendInstall(context: Context, prefs: android.content.SharedPreferences, referrer: String?) {
+    private fun sendInstall(
+        context: Context,
+        prefs: android.content.SharedPreferences,
+        referrer: String?,
+        dedupeKey: String = "install",
+        beginSession: Boolean = true,
+    ) {
         val uid = userId ?: return
         deferredMatchToken(referrer)?.let { matchToken ->
             prefs.edit().putString(DEFERRED_MATCH_TOKEN_KEY, matchToken).apply()
@@ -1051,8 +1091,12 @@ object TrackHub {
         val accepted = sendOrQueue(
             path = "install",
             rawBody = body.toString(),
-            kind = if (production) "production_install" else "test_install",
-            dedupeKey = "install",
+            kind = when {
+                !production -> "test_install"
+                dedupeKey == "install" -> "production_install"
+                else -> "production_install_referrer"
+            },
+            dedupeKey = dedupeKey,
         )
         if (accepted && production) {
             ingestToken?.let { token ->
@@ -1061,7 +1105,7 @@ object TrackHub {
                     .apply()
             }
         }
-        if (accepted) beginSessionIfNeeded(context)
+        if (accepted && beginSession) beginSessionIfNeeded(context)
     }
 
     internal fun deferredMatchToken(referrer: String?): String? {
@@ -1151,6 +1195,7 @@ object TrackHub {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val body = JSONObject()
             .put("user_id", uid)
+            .put("install_uid", installUid(context))
             .put("platform", "android")
             .put("sdk_name", "trackhub-android")
             .put("sdk_version", SDK_VERSION)
@@ -1584,6 +1629,7 @@ object TrackHub {
             log("legacy offline queue migration could not be completed")
             return migrated ?: JSONArray()
         }
+        migrateRotatedQueues(context, queueKey)
         if (!file.exists() && !backup.exists()) return JSONArray()
 
         val atomic = AtomicFile(file)
@@ -1606,6 +1652,58 @@ object TrackHub {
         quarantinePendingQueue(file)
         log("offline queue was corrupt or oversized — quarantined")
         return JSONArray()
+    }
+
+    /**
+     * An sdkKey rotation changes the hashed queue namespace. Merge every queue
+     * from the same environment into the active namespace before delivery so
+     * already-durable reports cannot be stranded under the previous token.
+     */
+    private fun migrateRotatedQueues(context: Context, queueKey: String) {
+        val marker = "-app-"
+        if (!queueKey.contains(marker)) return
+        val environmentKey = queueKey.substringBeforeLast(marker)
+        val target = pendingQueueFile(context, queueKey)
+        val prefix = "trackhub-$environmentKey-app-"
+        val candidateBases = context.noBackupFilesDir.listFiles()
+            ?.asSequence()
+            ?.filter { it.name.startsWith(prefix) && it.name.contains(".json") && !it.name.contains(".corrupt-") }
+            ?.map { file -> File(file.path.removeSuffix(".bak")) }
+            ?.filter { it.path != target.path }
+            ?.distinctBy { it.path }
+            ?.toList()
+            .orEmpty()
+        if (candidateBases.isEmpty()) return
+
+        fun readQueue(file: File): JSONArray? = runCatching {
+            AtomicFile(file).openRead().bufferedReader(Charsets.UTF_8).use { reader ->
+                decodePending(reader.readText())
+            }
+        }.getOrNull()
+
+        val merged = readQueue(target) ?: JSONArray()
+        val ids = mutableSetOf<String>()
+        for (index in 0 until merged.length()) {
+            merged.optJSONObject(index)?.optString("id")?.takeIf { it.isNotEmpty() }?.let(ids::add)
+        }
+        val migrated = mutableListOf<File>()
+        for (candidate in candidateBases) {
+            val items = readQueue(candidate) ?: continue
+            for (index in 0 until items.length()) {
+                val item = items.optJSONObject(index) ?: continue
+                val id = item.optString("id")
+                if (id.isEmpty() || ids.add(id)) merged.put(item)
+            }
+            migrated += candidate
+        }
+        if (migrated.isEmpty()) return
+        trimPending(merged)
+        if (!persistPending(context, queueKey, merged)) {
+            log("rotated offline queues could not be migrated")
+            return
+        }
+        migrated.forEach { AtomicFile(it).delete() }
+        log("rotated offline queues migrated into the active sdkKey namespace")
     }
 
     private fun decodePending(raw: String): JSONArray? {
@@ -1714,6 +1812,19 @@ object TrackHub {
         responseBody: String?,
     ) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (code == 410 && isServerPrivacyStop(responseBody)) {
+            privacyStopRequested.set(true)
+            trackingDisabled = true
+            prefs.edit().putBoolean(PRIVACY_DISABLED_KEY, true).commit()
+            deleteAllInstallCredentials(context)
+            deletePendingErasure(context)
+            clearLocalMeasurementState(context, keepInstallCredential = false)
+            takePendingErasureCompletion()?.let { callback ->
+                runOnMainSafely("privacy completion") { callback(true) }
+            }
+            log("server confirmed device privacy erasure — tracking stopped")
+            return
+        }
         val items = loadPending(context, queueKey)
         var index = -1
         for (i in 0 until items.length()) {
@@ -1778,6 +1889,16 @@ object TrackHub {
         } else {
             log("${pending.path} rejected with HTTP $code — not retried")
         }
+    }
+
+    internal fun isServerPrivacyStop(responseBody: String?): Boolean {
+        val body = responseBody?.takeIf { it.length <= 4096 } ?: return false
+        if (!body.trim().let { it.startsWith('{') && it.endsWith('}') }) return false
+        val error = Regex("\\\"error\\\"\\s*:\\s*\\\"(device_erased|privacy_erased)\\\"")
+            .find(body)
+            ?.groupValues
+            ?.getOrNull(1)
+        return error == "device_erased" || error == "privacy_erased"
     }
 
     internal fun offlineQueueNamespace(testToken: String?, appToken: String? = null): String {
@@ -1962,32 +2083,29 @@ object TrackHub {
         context.packageManager.getPackageInfo(context.packageName, 0).versionName
     }.getOrNull()
 
-    @Synchronized
-    private fun firstOpenAt(context: Context): Date {
+    private fun firstOpenAt(context: Context): Date = synchronized(identityStateLock) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val stored = prefs.getLong(FIRST_OPEN_AT_KEY, 0L)
-        if (stored > 0L) return Date(stored)
+        if (stored > 0L) return@synchronized Date(stored)
         val now = System.currentTimeMillis()
         prefs.edit().putLong(FIRST_OPEN_AT_KEY, now).apply()
-        return Date(now)
+        Date(now)
     }
 
-    @Synchronized
-    private fun persistentDeviceId(context: Context): String {
+    private fun persistentDeviceId(context: Context): String = synchronized(identityStateLock) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        prefs.getString(DEVICE_ID_KEY, null)?.takeIf { it.isNotBlank() }?.let { return it }
+        prefs.getString(DEVICE_ID_KEY, null)?.takeIf { it.isNotBlank() }?.let { return@synchronized it }
         val value = UUID.randomUUID().toString()
         prefs.edit().putString(DEVICE_ID_KEY, value).apply()
-        return value
+        value
     }
 
-    @Synchronized
-    private fun installUid(context: Context): String {
+    private fun installUid(context: Context): String = synchronized(identityStateLock) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        prefs.getString(INSTALL_UID_KEY, null)?.takeIf { it.isNotBlank() }?.let { return it }
+        prefs.getString(INSTALL_UID_KEY, null)?.takeIf { it.isNotBlank() }?.let { return@synchronized it }
         val value = UUID.randomUUID().toString()
         prefs.edit().putString(INSTALL_UID_KEY, value).apply()
-        return value
+        value
     }
 
     internal fun isValidInstallCredential(token: String): Boolean =

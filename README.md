@@ -1,6 +1,6 @@
 # TrackHub Android SDK 2.0
 
-> Current release: `2.0.2` · minSdk 26 · Java/JVM 17 · Kotlin 2.1 · Apphud 3.4.2
+> Current release: `2.0.3` · minSdk 26 · Java/JVM 17 · Kotlin 2.1 · Apphud 3.4.2
 
 TrackHub measures installs, automatic sessions and engagement events, captures Google/OpenAI click
 references, and automatically joins the installation to Apphud. It does not require an application
@@ -20,7 +20,7 @@ JitPack example:
 repositories { maven("https://jitpack.io") }
 
 dependencies {
-    implementation("com.github.Alexander-kuksa:trackhub-android:2.0.2")
+    implementation("com.github.Alexander-kuksa:trackhub-android:2.0.3")
 }
 ```
 
@@ -36,6 +36,20 @@ implementation("com.google.android.gms:play-services-appset:16.1.0")
 
 TrackHub does not add `AD_ID` permission automatically. Declare it only when your consent/policy
 allows advertising identifier collection. `INTERNET` is included by the library manifest.
+
+TrackHub must be started and called from the application's main process. The SDK intentionally does
+not coordinate its singleton or queue across multiple Android processes.
+
+Exclude TrackHub identifiers from Android backup and device transfer. The library ships copy-ready
+rules as `@xml/trackhub_backup_rules` (Android 11 and older) and
+`@xml/trackhub_data_extraction_rules` (Android 12+). Merge their `trackhub.xml` exclusions into the
+application's existing rules, or reference them directly when the app has no other backup policy:
+
+```xml
+<application
+    android:fullBackupContent="@xml/trackhub_backup_rules"
+    android:dataExtractionRules="@xml/trackhub_data_extraction_rules" />
+```
 
 ## Minimal integration
 
@@ -213,7 +227,7 @@ TrackHub does not initialize Firebase, request notification permission or show n
 | Delivery | one network worker; state executor remains available while server hangs |
 | Network | bounded connect/read timeouts and 64 KiB response cap |
 | Retries | transport/408/429/5xx, full-jitter exponential backoff, cap 5 min |
-| Install Referrer | 3-second watchdog falls back to organic instead of stalling sessions |
+| Install Referrer | 3-second watchdog falls back to organic; a late vendor result is sent as an attribution refinement |
 | Clock skew | trusted server time corrects signing only; event stays queued |
 | Corruption | queue is quarantined, not allowed to crash the app |
 | Privacy | immediate durable stop; retry survives process death/server outage |

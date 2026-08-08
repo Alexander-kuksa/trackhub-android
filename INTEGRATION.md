@@ -27,7 +27,7 @@ them by identity/install/transaction without making the mobile app a financial s
 - compileSdk 34 or newer
 - Java/JVM 17
 - Kotlin 2.1-compatible toolchain
-- TrackHub Android 2.0.2
+- TrackHub Android 2.0.3
 - Apphud Android 3.4.2 or a compatible newer 3.x
 - SDK Signature enabled and a TrackHub SDK Key copied from Setup
 - Apphud webhook linked to the same TrackHub app
@@ -43,7 +43,7 @@ maven("https://jitpack.io")
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.Alexander-kuksa:trackhub-android:2.0.2")
+    implementation("com.github.Alexander-kuksa:trackhub-android:2.0.3")
 }
 ```
 
@@ -53,6 +53,32 @@ policy requires it:
 ```xml
 <uses-permission android:name="com.google.android.gms.permission.AD_ID" />
 ```
+
+Run TrackHub only in the application's main process. If the app declares services or providers in
+other processes, do not call `TrackHub.start` or any tracking API from them.
+
+The SDK's `trackhub.xml` preferences contain installation identifiers and must not move to another
+device through backup/restore. Merge the exclusions from the packaged
+`@xml/trackhub_backup_rules` and `@xml/trackhub_data_extraction_rules` into the host application's
+backup policy. A direct manifest reference is sufficient when the host has no other rules:
+
+```xml
+<application
+    android:fullBackupContent="@xml/trackhub_backup_rules"
+    android:dataExtractionRules="@xml/trackhub_data_extraction_rules" />
+```
+
+### Google Play Data safety
+
+The host app owns the final Play Console declaration. Review the enabled TrackHub features and the
+server forwarding configuration instead of copying a static answer. The baseline integration sends
+app interactions, app/version/device metadata, an installation/user identifier, country when the
+host supplies it, consent state and purchase transaction identifiers to the developer-operated
+Daively service for analytics and fraud prevention. Optional features add advertising ID, push
+token, crash/diagnostic context, purchase history and campaign/deep-link identifiers. Declare data
+sharing when Daively forwards consented events to Google Ads/GA4 or another configured provider,
+and document account deletion/erasure using `gdprForgetMe`. TrackHub does not collect contacts,
+messages, photos, audio, precise location, health or financial-account credentials.
 
 ## 4. Application startup
 
@@ -231,7 +257,8 @@ The SDK only forwards an existing token and never requests notification permissi
 - hung Install Referrer: organic fallback after watchdog;
 - wrong device clock: signed event stays queued and uses trusted clock correction;
 - `gdprForgetMe` offline + process kill + online restart: no tracking resumes and erase completes;
-- SDK secret rotation: previous key accepted during grace, new key works immediately.
+- SDK secret rotation: previous key accepted during grace, new key works immediately and its queue
+  namespace adopts reports durably written under the prior key.
 
 ## 14. Release checklist
 
@@ -239,6 +266,9 @@ The SDK only forwards an existing token and never requests notification permissi
 - [ ] one compatible Apphud dependency resolves
 - [ ] Apphud starts before TrackHub
 - [ ] SDK Key never appears in logs/URLs/analytics
+- [ ] TrackHub runs only in the application main process
+- [ ] `trackhub.xml` is excluded from cloud backup and device transfer
+- [ ] Play Data safety answers match the enabled identifiers, purchase events and forwarding providers
 - [ ] consent mapping distinguishes unknown/denied/granted
 - [ ] actual country is supplied when known
 - [ ] launch/runtime intents are forwarded
@@ -253,7 +283,7 @@ The SDK only forwards an existing token and never requests notification permissi
 | Symptom | Check |
 |---|---|
 | SDK not detected | SDK Key/app, clean install, HTTPS, signature enabled |
-| session before install | use 2.0.2; install/referrer watchdog queues install first |
+| session before install | use 2.0.3; install/referrer watchdog queues install first |
 | Apphud revenue not joined | webhook app/secret, transaction id, identity binding |
 | deferred path missing | Play referrer contains TrackHub match token; install was acknowledged |
 | no GAID | consent, AD_ID permission, ads-identifier runtime, LAT |
