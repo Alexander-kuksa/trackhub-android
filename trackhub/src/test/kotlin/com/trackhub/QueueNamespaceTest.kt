@@ -15,5 +15,9 @@ class QueueNamespaceTest {
         assertTrue(a.startsWith("test-"))
         assertNotEquals(a, b)
         assertFalse(a.contains("test-run-token"))
+        assertNotEquals(
+            TrackHub.offlineQueueNamespace(null, "app-token-a-with-enough-entropy"),
+            TrackHub.offlineQueueNamespace(null, "app-token-b-with-enough-entropy"),
+        )
     }
 }

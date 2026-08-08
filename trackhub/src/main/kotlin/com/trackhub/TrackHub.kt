@@ -96,7 +96,7 @@ enum class TrackHubSalesEvent(val value: String) {
 object TrackHub {
 
     /** SDK version reported to the platform for integration detection. */
-    const val SDK_VERSION = "2.0.1"
+    const val SDK_VERSION = "2.0.2"
 
     private const val PREFS = "trackhub"
     private const val INSTALL_SENT_KEY = "install_sent"
@@ -120,8 +120,10 @@ object TrackHub {
     private const val APPHUD_ATTRIBUTION_REVISION_PREFIX = "apphud_attribution_revision_"
     private const val DEFERRED_RESOLVE_PREFIX = "deferred_resolve_"
     private const val DEFERRED_MATCH_TOKEN_KEY = "deferred_match_token"
-    private const val PRIVACY_DISABLED_PREFIX = "privacy_disabled_"
-    private const val PENDING_ERASURE_PREFIX = "pending_erasure_"
+    private const val PRIVACY_DISABLED_KEY = "privacy_disabled_v2"
+    private const val PENDING_ERASURE_KEY = "pending_erasure_v2"
+    private const val LEGACY_PRIVACY_DISABLED_PREFIX = "privacy_disabled_"
+    private const val LEGACY_PENDING_ERASURE_PREFIX = "pending_erasure_"
     private const val APPHUD_USER_ID_PREFIX = "apphud_user_id_"
     private const val INSTALL_CREDENTIAL_BOOTSTRAP_PREFIX = "install_credential_bootstrap_"
     private const val AD_USER_DATA_KEY = "consent_ad_user_data"
@@ -246,8 +248,9 @@ object TrackHub {
         this.deferredDeepLinkHandler = configuration.deferredDeepLinkHandler
         this.debug = configuration.debugLogging
         this.appContext = configuredAppContext
-        val privacyComplete = hasPersistedPrivacyDisable(configuredAppContext, decoded.ingestToken)
-        var privacyPendingJob = loadPendingErasure(configuredAppContext, decoded.ingestToken)
+        migrateLegacyPrivacyState(configuredAppContext)
+        val privacyComplete = hasPersistedPrivacyDisable(configuredAppContext)
+        var privacyPendingJob = loadPendingErasure(configuredAppContext)
         // If the app died after persisting the local stop but before the job
         // file reached storage, reconstruct it from the retained install UID.
         if (privacyComplete && privacyPendingJob == null) {
@@ -257,13 +260,13 @@ object TrackHub {
                     .put("reason", "user_requested")
                     .put("attempts", 0)
                     .put("next_attempt_at_ms", 0L)
-                if (persistPendingErasure(configuredAppContext, decoded.ingestToken, recovered)) {
+                if (persistPendingErasure(configuredAppContext, recovered)) {
                     privacyPendingJob = recovered
                 }
             }
         }
         val privacyPending = privacyPendingJob != null
-            || hasPendingErasureState(configuredAppContext, decoded.ingestToken)
+            || hasPendingErasureState(configuredAppContext)
         if (privacyStopRequested.get() || privacyPending || privacyComplete) {
             privacyStopRequested.set(true)
             trackingDisabled = true
@@ -437,39 +440,53 @@ object TrackHub {
     }
 
     /**
-     * Stops tracking immediately and durably requests erasure of this
-     * installation. The request survives process death and offline launches;
-     * it is retried on every foreground until TrackHub confirms 200/410.
+     * Context overload matching Adjust's Android privacy API. This form is
+     * crash-safe even when called before TrackHub.start(). It stops tracking
+     * immediately and retries erasure on later foregrounds until TrackHub
+     * confirms 200/410.
      */
     @JvmStatic
     @JvmOverloads
-    fun gdprForgetMe(reason: String = "user_requested", completion: ((Boolean) -> Unit)? = null) {
+    fun gdprForgetMe(
+        context: Context,
+        reason: String = "user_requested",
+        completion: ((Boolean) -> Unit)? = null,
+    ) {
         privacyStopRequested.set(true)
         trackingDisabled = true
         currentAttribution = null
-        val context = appContext
-        val token = ingestToken
-        if (context == null || token.isNullOrBlank()) {
-            completion?.let { runOnMainSafely("privacy completion") { it(false) } }
+        val configuredContext = context.applicationContext
+        this.appContext = configuredContext
+        val prefs = configuredContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (prefs.getBoolean(PRIVACY_DISABLED_KEY, false)
+            && !hasPendingErasureState(configuredContext)
+            && prefs.getString(INSTALL_UID_KEY, null) == null
+        ) {
+            completion?.let { runOnMainSafely("privacy completion") { it(true) } }
             return
         }
-        val installUid = installUid(context)
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-            .putBoolean(PRIVACY_DISABLED_PREFIX + hashKey(token), true)
+        val installUid = loadPendingErasure(configuredContext)?.optString("install_uid")
+            ?.takeIf(::isUuid)
+            ?: installUid(configuredContext)
+        prefs.edit()
+            .putBoolean(PRIVACY_DISABLED_KEY, true)
             .commit()
         val job = JSONObject()
             .put("install_uid", installUid)
             .put("reason", reason.take(256))
             .put("attempts", 0)
             .put("next_attempt_at_ms", 0L)
-        if (!persistPendingErasure(context, token, job)) {
+            .put("launch_only", false)
+        if (loadPendingErasure(configuredContext) == null
+            && !persistPendingErasure(configuredContext, job)
+        ) {
             completion?.let { runOnMainSafely("privacy completion") { it(false) } }
             return
         }
         pendingErasureCompletion = completion
         io.execute {
-            clearLocalMeasurementState(context, keepInstallCredential = true)
-            retryPendingErasure()
+            clearLocalMeasurementState(configuredContext, keepInstallCredential = true)
+            if (!ingestToken.isNullOrBlank()) retryPendingErasure()
         }
     }
 
@@ -636,31 +653,72 @@ object TrackHub {
     internal fun normalizedOpenAiOppref(raw: String?): String? =
         raw?.trim()?.takeIf { it.isNotEmpty() && it.length <= 1024 }
 
-    private fun hasPersistedPrivacyDisable(
-        context: Context,
-        token: String? = ingestToken,
-    ): Boolean {
-        val scopedToken = token?.takeIf { it.isNotBlank() } ?: return trackingDisabled
-        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getBoolean(PRIVACY_DISABLED_PREFIX + hashKey(scopedToken), false)
-    }
+    private fun hasPersistedPrivacyDisable(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(PRIVACY_DISABLED_KEY, false)
 
-    private fun pendingErasureFile(context: Context, token: String): File =
-        File(context.noBackupFilesDir, "trackhub-pending-erasure-${hashKey(token)}.json")
+    private fun pendingErasureFile(context: Context): File =
+        File(context.noBackupFilesDir, "trackhub-pending-erasure-v2.json")
 
-    private fun hasPendingErasureState(context: Context, token: String): Boolean {
-        val base = pendingErasureFile(context, token)
+    private fun hasPendingErasureState(context: Context): Boolean {
+        val base = pendingErasureFile(context)
         if (base.exists()) return true
         // AtomicFile can leave a recovery sibling after a process or storage
         // failure. Any such state keeps privacy fail-closed.
         return base.parentFile?.listFiles()?.any { it.name.startsWith(base.name) } == true
     }
 
+    /** Recover token-scoped SDK 2.0 jobs even after the app starts with a newly
+     * rotated sdkKey. The app sandbox itself is the privacy namespace. */
     @Synchronized
-    private fun persistPendingErasure(context: Context, token: String, job: JSONObject): Boolean {
+    private fun migrateLegacyPrivacyState(context: Context) {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (prefs.all.any { (key, value) ->
+                key.startsWith(LEGACY_PRIVACY_DISABLED_PREFIX)
+                    && key != PRIVACY_DISABLED_KEY
+                    && value == true
+            }
+        ) {
+            prefs.edit().putBoolean(PRIVACY_DISABLED_KEY, true).commit()
+        }
+        if (loadPendingErasure(context) != null) return
+
+        val fileCandidates = context.noBackupFilesDir.listFiles()?.filter {
+            it.name.startsWith("trackhub-pending-erasure-")
+                && it.name != "trackhub-pending-erasure-v2.json"
+        }.orEmpty()
+        for (file in fileCandidates) {
+            val job = runCatching {
+                val raw = file.readText(Charsets.UTF_8)
+                if (raw.toByteArray(Charsets.UTF_8).size > 1024) null else JSONObject(raw)
+            }.getOrNull()?.takeIf {
+                isUuid(it.optString("install_uid")) && it.optString("reason").length <= 256
+            } ?: continue
+            if (persistPendingErasure(context, job)) {
+                runCatching { file.delete() }
+                prefs.edit().putBoolean(PRIVACY_DISABLED_KEY, true).commit()
+                return
+            }
+        }
+        for ((key, value) in prefs.all) {
+            if (!key.startsWith(LEGACY_PENDING_ERASURE_PREFIX) || key == PENDING_ERASURE_KEY) continue
+            val raw = value as? String ?: continue
+            if (raw.toByteArray(Charsets.UTF_8).size > 1024) continue
+            val job = runCatching { JSONObject(raw) }.getOrNull()?.takeIf {
+                isUuid(it.optString("install_uid")) && it.optString("reason").length <= 256
+            } ?: continue
+            if (persistPendingErasure(context, job)) {
+                prefs.edit().remove(key).putBoolean(PRIVACY_DISABLED_KEY, true).commit()
+                return
+            }
+        }
+    }
+
+    @Synchronized
+    private fun persistPendingErasure(context: Context, job: JSONObject): Boolean {
         val bytes = job.toString().toByteArray(Charsets.UTF_8)
         if (bytes.size > 1024) return false
-        val atomic = AtomicFile(pendingErasureFile(context, token))
+        val atomic = AtomicFile(pendingErasureFile(context))
         var output: FileOutputStream? = null
         return try {
             output = atomic.startWrite()
@@ -668,7 +726,7 @@ object TrackHub {
             output.flush()
             atomic.finishWrite(output)
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-                .remove(PENDING_ERASURE_PREFIX + hashKey(token))
+                .remove(PENDING_ERASURE_KEY)
                 .commit()
             true
         } catch (_: Throwable) {
@@ -676,14 +734,14 @@ object TrackHub {
             // Keep a synchronous second copy if AtomicFile cannot be opened.
             // A killed process must still resume the privacy request.
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-                .putString(PENDING_ERASURE_PREFIX + hashKey(token), job.toString())
+                .putString(PENDING_ERASURE_KEY, job.toString())
                 .commit()
         }
     }
 
     @Synchronized
-    private fun loadPendingErasure(context: Context, token: String): JSONObject? {
-        val atomic = AtomicFile(pendingErasureFile(context, token))
+    private fun loadPendingErasure(context: Context): JSONObject? {
+        val atomic = AtomicFile(pendingErasureFile(context))
         val fromFile = runCatching {
             atomic.openRead().bufferedReader(Charsets.UTF_8).use { reader ->
                 val raw = reader.readText()
@@ -695,7 +753,7 @@ object TrackHub {
         }.getOrNull()
         if (fromFile != null) return fromFile
         val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getString(PENDING_ERASURE_PREFIX + hashKey(token), null)
+            .getString(PENDING_ERASURE_KEY, null)
             ?: return null
         if (raw.toByteArray(Charsets.UTF_8).size > 1024) return null
         return runCatching { JSONObject(raw) }.getOrNull()?.takeIf {
@@ -704,10 +762,10 @@ object TrackHub {
     }
 
     @Synchronized
-    private fun deletePendingErasure(context: Context, token: String) {
-        runCatching { AtomicFile(pendingErasureFile(context, token)).delete() }
+    private fun deletePendingErasure(context: Context) {
+        runCatching { AtomicFile(pendingErasureFile(context)).delete() }
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-            .remove(PENDING_ERASURE_PREFIX + hashKey(token))
+            .remove(PENDING_ERASURE_KEY)
             .commit()
     }
 
@@ -733,10 +791,21 @@ object TrackHub {
             .remove(PENDING_OPENAI_OPPREF_KEY)
             .remove(DEFERRED_MATCH_TOKEN_KEY)
             .remove(DEVICE_ID_KEY)
+            .remove(FIRST_OPEN_AT_KEY)
+            .remove(SESSION_SEQ_KEY)
+            .remove(LAST_BACKGROUND_KEY)
+            .remove(COUNTRY_CODE_KEY)
+            .remove(AD_USER_DATA_KEY)
+            .remove(AD_PERSONALIZATION_KEY)
+            .remove(EEA_KEY)
+            .remove(PIPL_CONSENT_KEY)
+            .remove(CROSS_BORDER_TRANSFER_CONSENT_KEY)
+            .remove(ADS_MEASUREMENT_CONSENT_KEY)
         prefs.all.keys.filter {
             it.startsWith(APPHUD_ATTRIBUTION_REVISION_PREFIX) ||
                 it.startsWith(APPHUD_USER_ID_PREFIX) ||
-                it.startsWith(DEFERRED_RESOLVE_PREFIX)
+                it.startsWith(DEFERRED_RESOLVE_PREFIX) ||
+                it.startsWith(INSTALL_CREDENTIAL_BOOTSTRAP_PREFIX)
         }.forEach(edit::remove)
         if (!keepInstallCredential) {
             edit.remove(INSTALL_UID_KEY).remove(INSTALL_SENT_KEY)
@@ -755,10 +824,11 @@ object TrackHub {
         val context = appContext ?: return
         val token = ingestToken ?: return
         val networkConfig = currentNetworkConfig() ?: return
-        val job = loadPendingErasure(context, token) ?: return
+        val job = loadPendingErasure(context) ?: return
         val nextAttemptAtMs = job.optLong("next_attempt_at_ms", 0L)
         val delayMs = nextAttemptAtMs - System.currentTimeMillis()
         if (delayMs > 0) {
+            if (job.optBoolean("launch_only", false)) return
             watchdog.schedule({ io.execute { retryPendingErasure() } }, delayMs, TimeUnit.MILLISECONDS)
             return
         }
@@ -786,11 +856,11 @@ object TrackHub {
             io.execute {
                 erasureInFlight = false
                 if (result.first in 200..299 || result.first == 410) {
-                    deleteInstallCredential(context, token, installUid)
+                    deleteAllInstallCredentials(context)
                     context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-                        .putBoolean(PRIVACY_DISABLED_PREFIX + hashKey(token), true)
+                        .putBoolean(PRIVACY_DISABLED_KEY, true)
                         .commit()
-                    deletePendingErasure(context, token)
+                    deletePendingErasure(context)
                     clearLocalMeasurementState(context, keepInstallCredential = false)
                     pendingErasureCompletion?.let { callback ->
                         runOnMainSafely("privacy completion") { callback(true) }
@@ -801,14 +871,27 @@ object TrackHub {
                 }
 
                 val attempts = job.optInt("attempts", 0).coerceAtLeast(0) + 1
-                val exponent = min(attempts - 1, 9)
-                val cap = min(RETRY_MAX_MS, RETRY_BASE_MS * (1L shl exponent))
-                val retryDelayMs = Random.nextLong(cap + 1)
+                val retryable = result.first < 0
+                    || result.first == 408
+                    || result.first == 429
+                    || result.first >= 500
+                val retryDelayMs = if (retryable) {
+                    val exponent = min(attempts - 1, 9)
+                    val cap = min(RETRY_MAX_MS, RETRY_BASE_MS * (1L shl exponent))
+                    Random.nextLong(cap + 1)
+                } else {
+                    24 * 60 * 60_000L
+                }
                 job.put("attempts", attempts)
                     .put("next_attempt_at_ms", System.currentTimeMillis() + retryDelayMs)
-                persistPendingErasure(context, token, job)
-                watchdog.schedule({ io.execute { retryPendingErasure() } }, retryDelayMs, TimeUnit.MILLISECONDS)
-                log("privacy erasure pending — retrying with backoff")
+                    .put("launch_only", !retryable)
+                persistPendingErasure(context, job)
+                if (retryable) {
+                    watchdog.schedule({ io.execute { retryPendingErasure() } }, retryDelayMs, TimeUnit.MILLISECONDS)
+                    log("privacy erasure pending — retrying with backoff")
+                } else {
+                    log("privacy erasure rejected — retry deferred until a later launch/foreground")
+                }
             }
         }
     }
@@ -1464,6 +1547,31 @@ object TrackHub {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val file = pendingQueueFile(context, queueKey)
         val backup = File(file.path + ".bak")
+        val legacyQueueKey = legacyQueueKey(queueKey)
+        if (!file.exists() && !backup.exists() && legacyQueueKey != null) {
+            val legacyFile = pendingQueueFile(context, legacyQueueKey)
+            val legacyBackup = File(legacyFile.path + ".bak")
+            if (legacyFile.exists() || legacyBackup.exists()) {
+                val migrated = runCatching {
+                    AtomicFile(legacyFile).openRead().bufferedReader(Charsets.UTF_8).use { reader ->
+                        decodePending(reader.readText())
+                    }
+                }.getOrNull()
+                if (migrated != null && persistPending(context, queueKey, migrated)) {
+                    AtomicFile(legacyFile).delete()
+                    prefs.edit().remove(legacyQueueKey).commit()
+                    return migrated
+                }
+                log("legacy offline queue file migration could not be completed")
+            }
+            if (prefs.contains(legacyQueueKey)) {
+                val migrated = decodePending(prefs.getString(legacyQueueKey, "[]") ?: "[]")
+                if (migrated != null && persistPending(context, queueKey, migrated)) {
+                    prefs.edit().remove(legacyQueueKey).commit()
+                    return migrated
+                }
+            }
+        }
         if (!file.exists() && !backup.exists() && prefs.contains(queueKey)) {
             // One-time migration from SDK <= 1.6.0. Delete the legacy value
             // only after AtomicFile has durably committed the same queue.
@@ -1624,8 +1732,7 @@ object TrackHub {
             } else {
                 val exponent = min(attempts - 1, 9)
                 val cap = min(RETRY_MAX_MS, RETRY_BASE_MS * (1L shl exponent))
-                val half = (cap / 2).coerceAtLeast(1L)
-                half + Random.nextLong(half + 1)
+                Random.nextLong(cap + 1)
             }
             val nextAttemptAtMs = System.currentTimeMillis() + delayMs
             item.put("attempts", attempts)
@@ -1673,17 +1780,33 @@ object TrackHub {
         }
     }
 
-    internal fun offlineQueueNamespace(testToken: String?): String {
-        if (testToken.isNullOrEmpty()) return "production"
-        val digest = MessageDigest.getInstance("SHA-256").digest(testToken.toByteArray(Charsets.UTF_8))
-        return "test-" + digest.take(8).joinToString("") { "%02x".format(it.toInt() and 0xff) }
+    internal fun offlineQueueNamespace(testToken: String?, appToken: String? = null): String {
+        val environment = if (testToken.isNullOrEmpty()) {
+            "production"
+        } else {
+            val digest = MessageDigest.getInstance("SHA-256").digest(testToken.toByteArray(Charsets.UTF_8))
+            "test-" + digest.take(8).joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        }
+        if (appToken.isNullOrBlank()) return environment
+        val appDigest = MessageDigest.getInstance("SHA-256").digest(appToken.toByteArray(Charsets.UTF_8))
+        val app = appDigest.take(8).joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        return "$environment-app-$app"
     }
 
-    private fun pendingReportsKey(testToken: String? = integrationTestToken): String {
-        val namespace = offlineQueueNamespace(testToken)
-        // Keep the historical production key so an SDK update does not strand
-        // real reports already buffered by an older version.
-        return if (namespace == "production") PENDING_REPORTS_KEY else "${PENDING_REPORTS_KEY}_$namespace"
+    private fun pendingReportsKey(
+        testToken: String? = integrationTestToken,
+        appToken: String? = ingestToken,
+    ): String = "${PENDING_REPORTS_KEY}_${offlineQueueNamespace(testToken, appToken)}"
+
+    private fun legacyQueueKey(queueKey: String): String? {
+        val marker = "-app-"
+        if (!queueKey.contains(marker)) return null
+        val environmentKey = queueKey.substringBeforeLast(marker)
+        return if (environmentKey == "${PENDING_REPORTS_KEY}_production") {
+            PENDING_REPORTS_KEY
+        } else {
+            environmentKey
+        }
     }
 
     internal fun offlineQueueCount(context: Context, testToken: String?): Int =
@@ -1706,8 +1829,8 @@ object TrackHub {
         deletePendingQueue(context.applicationContext, pendingReportsKey(testToken))
     }
 
-    internal fun hasPendingErasureForTest(context: Context, token: String): Boolean =
-        loadPendingErasure(context.applicationContext, token) != null
+    internal fun hasPendingErasureForTest(context: Context, @Suppress("UNUSED_PARAMETER") token: String): Boolean =
+        loadPendingErasure(context.applicationContext) != null
 
     internal fun isTrackingStoppedForTest(): Boolean =
         trackingDisabled && privacyStopRequested.get()
@@ -1927,6 +2050,12 @@ object TrackHub {
 
     private fun deleteInstallCredential(context: Context, token: String, installUid: String) {
         runCatching { AtomicFile(installCredentialFile(context, token, installUid)).delete() }
+    }
+
+    private fun deleteAllInstallCredentials(context: Context) {
+        context.noBackupFilesDir.listFiles()?.filter {
+            it.name.startsWith("trackhub_install_credential_")
+        }?.forEach { runCatching { it.delete() } }
     }
 
     private fun installCredentialBootstrapKey(token: String): String =

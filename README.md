@@ -1,6 +1,6 @@
 # TrackHub Android SDK 2.0
 
-> Current release: `2.0.1` · minSdk 26 · Java/JVM 17 · Kotlin 2.1 · Apphud 3.4.2
+> Current release: `2.0.2` · minSdk 26 · Java/JVM 17 · Kotlin 2.1 · Apphud 3.4.2
 
 TrackHub measures installs, automatic sessions and engagement events, captures Google/OpenAI click
 references, and automatically joins the installation to Apphud. It does not require an application
@@ -20,7 +20,7 @@ JitPack example:
 repositories { maven("https://jitpack.io") }
 
 dependencies {
-    implementation("com.github.Alexander-kuksa:trackhub-android:2.0.1")
+    implementation("com.github.Alexander-kuksa:trackhub-android:2.0.2")
 }
 ```
 
@@ -171,10 +171,13 @@ TrackHub.resolveDeferredDeepLink { path -> path?.let(router::open) }
 
 ```kotlin
 TrackHub.attribution { snapshot -> /* optional read */ }
-TrackHub.gdprForgetMe()
+TrackHub.gdprForgetMe(applicationContext)
 ```
 
-The SDK forwards attribution revisions to Apphud automatically. `gdprForgetMe()` has device scope:
+The SDK forwards attribution revisions to Apphud automatically. Use the `Context`
+overload shown above so the request is durable even before `TrackHub.start()`.
+The privacy state belongs to the app installation, not the rotatable SDK Key.
+`gdprForgetMe()` has device scope:
 
 1. an atomic in-process stop happens before returning;
 2. the measurement queue and local identifiers are cleared;
@@ -203,7 +206,7 @@ TrackHub does not initialize Firebase, request notification permission or show n
 
 | Area | Guarantee |
 |---|---|
-| Public calls | non-blocking state/network work; host exceptions are not propagated |
+| Public calls | state/network work is asynchronous except the small crash-safe privacy write in `gdprForgetMe`; host exceptions are not propagated |
 | Queue | `AtomicFile` under `noBackupFilesDir`, disk-first before delivery |
 | Bounds | 1,000 reports, 4 MiB total, 64 KiB per report |
 | Overflow | ordinary oldest reports evicted before the production install |

@@ -145,20 +145,14 @@ class TrackHubInstrumentedTest {
                 TrackHub.offlineQueuePathCount(context, outageToken, "sdk/track") >= 25
             }
 
-            // Exercise the start()/privacy race with a brand-new namespace:
-            // gdprForgetMe must bind to this key even before startOnIo runs.
+            // Exercise a privacy action before the replacement sdkKey starts.
+            // The durable job must belong to the app installation, survive the
+            // key rotation, and recover with the new credentials.
             val privacyIngestToken = "privacy-ingest-token-with-enough-entropy-9012"
             val privacySecret = "privacy-sdk-secret-with-enough-entropy-9012"
-            TrackHub.start(
-                context,
-                TrackHubConfig(
-                    sdkKey = sdkKey("http://127.0.0.1:9", privacyIngestToken, privacySecret),
-                    environment = TrackHubEnvironment.TestLab(outageToken),
-                ),
-            )
             val forgotten = AtomicBoolean(false)
             val forgetCompleted = CountDownLatch(1)
-            TrackHub.gdprForgetMe { accepted ->
+            TrackHub.gdprForgetMe(context) { accepted ->
                 forgotten.set(accepted)
                 forgetCompleted.countDown()
             }

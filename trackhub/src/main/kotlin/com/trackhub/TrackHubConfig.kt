@@ -55,7 +55,25 @@ data class TrackHubConfig(
     val piplConsent: TrackHubPiplConsent = TrackHubPiplConsent(),
     val attributionChangedHandler: TrackHubAttributionChangedHandler? = null,
     val deferredDeepLinkHandler: TrackHubDeferredDeepLinkHandler? = null,
-)
+) {
+    // Kotlin data classes include every constructor value in their generated
+    // toString(). sdkKey carries signing credentials, so never expose it to
+    // host logs, crash reporters, or debug tooling.
+    override fun toString(): String = "TrackHubConfig(" +
+        "sdkKey=<redacted>, " +
+        "environment=${when (environment) {
+            TrackHubEnvironment.Production -> "production"
+            is TrackHubEnvironment.TestLab -> "testLab(<redacted>)"
+        }}, " +
+        "debugLogging=$debugLogging, " +
+        "countryCode=$countryCode, " +
+        "collectAdvertisingId=$collectAdvertisingId, " +
+        "firebaseAppInstanceId=${if (firebaseAppInstanceId == null) "null" else "<redacted>"}, " +
+        "googleAdsConsent=$googleAdsConsent, " +
+        "piplConsent=$piplConsent, " +
+        "attributionChangedHandler=${attributionChangedHandler != null}, " +
+        "deferredDeepLinkHandler=${deferredDeepLinkHandler != null})"
+}
 
 internal data class DecodedTrackHubSdkKey(
     val endpoint: String,
