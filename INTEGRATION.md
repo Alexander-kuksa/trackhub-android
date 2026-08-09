@@ -27,7 +27,7 @@ them by identity/install/transaction without making the mobile app a financial s
 - compileSdk 34 or newer
 - Java/JVM 17
 - Kotlin 2.1-compatible toolchain
-- TrackHub Android 2.0.5
+- TrackHub Android 2.0.6
 - Apphud Android 3.4.2 or a compatible newer 3.x
 - SDK Signature enabled and a TrackHub SDK Key copied from Setup
 - Apphud webhook linked to the same TrackHub app
@@ -43,7 +43,7 @@ maven("https://jitpack.io")
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.Alexander-kuksa:trackhub-android:2.0.5")
+    implementation("com.github.Alexander-kuksa:trackhub-android:2.0.6")
 }
 ```
 
@@ -291,7 +291,7 @@ text; host callback failures remain the host application's responsibility.
 | Symptom | Check |
 |---|---|
 | SDK not detected | SDK Key/app, clean install, HTTPS, signature enabled |
-| session before install | use 2.0.5; install/referrer watchdog queues install first |
+| session before install | use 2.0.6; install/referrer watchdog queues install first |
 | Apphud revenue not joined | webhook app/secret, transaction id, identity binding |
 | deferred path missing | Play referrer contains TrackHub match token; install was acknowledged |
 | no GAID | consent, AD_ID permission, ads-identifier runtime, LAT |

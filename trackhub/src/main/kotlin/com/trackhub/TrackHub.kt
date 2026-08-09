@@ -33,6 +33,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -97,7 +98,7 @@ enum class TrackHubSalesEvent(val value: String) {
 object TrackHub {
 
     /** SDK version reported to the platform for integration detection. */
-    const val SDK_VERSION = "2.0.5"
+    const val SDK_VERSION = "2.0.6"
 
     private const val PREFS = "trackhub"
     private const val INSTALL_SENT_KEY = "install_sent"
@@ -2362,6 +2363,12 @@ object TrackHub {
     }
 
     internal fun runtimeCircuitOpenForTest(): Boolean = runtimeCircuitOpen.get()
+
+    internal fun awaitStateIdleForTest(timeoutMs: Long): Boolean {
+        val latch = CountDownLatch(1)
+        io.execute { latch.countDown() }
+        return latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+    }
 
     internal fun runFailSilentForTest(block: () -> Unit) {
         runFailSilent("test", block)

@@ -147,9 +147,20 @@ class TrackHubInstrumentedTest {
             val enqueueCallMs = SystemClock.elapsedRealtime() - startedAt
             assertTrue("public tracking calls blocked for ${enqueueCallMs}ms", enqueueCallMs < 2_000)
 
-            waitUntil("server outage queue persistence", timeoutMs = 30_000) {
-                TrackHub.offlineQueuePathCount(context, outageToken, "sdk/track") >= 25
-            }
+            // Each event is committed with AtomicFile/fsync. A cold x86 CI
+            // emulator can take more than an arbitrary wall-clock polling
+            // budget for 25 commits, so wait for a FIFO marker on the actual
+            // state executor before inspecting the durable queue.
+            assertTrue(
+                "SDK state executor did not drain after server outage",
+                TrackHub.awaitStateIdleForTest(120_000),
+            )
+            val queuedOutageEvents =
+                TrackHub.offlineQueuePathCount(context, outageToken, "sdk/track")
+            assertTrue(
+                "expected 25 durable outage events, found $queuedOutageEvents",
+                queuedOutageEvents >= 25,
+            )
             assertFalse(TrackHub.runtimeCircuitOpenForTest())
 
             // Exercise a privacy action before the replacement sdkKey starts.
