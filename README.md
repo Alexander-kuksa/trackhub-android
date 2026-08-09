@@ -1,6 +1,6 @@
 # TrackHub Android SDK 2.0
 
-> Current release: `2.0.4` · minSdk 26 · Java/JVM 17 · Kotlin 2.1 · Apphud 3.4.2
+> Current release: `2.0.5` · minSdk 26 · Java/JVM 17 · Kotlin 2.1 · Apphud 3.4.2
 
 TrackHub measures installs, automatic sessions and engagement events, captures Google/OpenAI click
 references, and automatically joins the installation to Apphud. It does not require an application
@@ -20,7 +20,7 @@ JitPack example:
 repositories { maven("https://jitpack.io") }
 
 dependencies {
-    implementation("com.github.Alexander-kuksa:trackhub-android:2.0.4")
+    implementation("com.github.Alexander-kuksa:trackhub-android:2.0.5")
 }
 ```
 

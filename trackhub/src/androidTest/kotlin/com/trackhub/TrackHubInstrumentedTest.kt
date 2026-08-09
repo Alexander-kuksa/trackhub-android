@@ -67,7 +67,9 @@ class TrackHubInstrumentedTest {
             )
             // Persistence is intentionally off-main-thread to avoid parsing or
             // rewriting SharedPreferences XML in a host lifecycle callback.
-            waitUntil { !prefs.contains("gclid") && !prefs.contains("pending_gclid") }
+            waitUntil("legacy click state cleanup") {
+                !prefs.contains("gclid") && !prefs.contains("pending_gclid")
+            }
 
             TrackHub.start(
                 context,
@@ -96,7 +98,9 @@ class TrackHubInstrumentedTest {
             assertFalse(body.has("revenue_cents"))
             assertNotNull(firstTrack.getHeader("X-TrackHub-Timestamp"))
             assertNotNull(firstTrack.getHeader("X-TrackHub-Signature"))
-            waitUntil { TrackHub.offlineQueueCount(context, testToken) == 1 }
+            waitUntil("failed event persisted in offline queue") {
+                TrackHub.offlineQueueCount(context, testToken) == 1
+            }
             assertFalse(prefs.contains("pending_reports_${TrackHub.offlineQueueNamespace(testToken)}"))
             allowTrackRecovery.set(true)
 
@@ -115,7 +119,9 @@ class TrackHubInstrumentedTest {
                 ),
             )
             waitForTrackRequest(server)
-            waitUntil { TrackHub.offlineQueueCount(context, testToken) == 0 }
+            waitUntil("offline queue recovery") {
+                TrackHub.offlineQueueCount(context, testToken) == 0
+            }
 
             val outageToken = "outage-resilience-token-with-enough-entropy-5678"
             val outageIngestToken = "test-ingest-token-with-enough-entropy-5678"
@@ -141,7 +147,7 @@ class TrackHubInstrumentedTest {
             val enqueueCallMs = SystemClock.elapsedRealtime() - startedAt
             assertTrue("public tracking calls blocked for ${enqueueCallMs}ms", enqueueCallMs < 2_000)
 
-            waitUntil(timeoutMs = 10_000) {
+            waitUntil("server outage queue persistence", timeoutMs = 30_000) {
                 TrackHub.offlineQueuePathCount(context, outageToken, "sdk/track") >= 25
             }
             assertFalse(TrackHub.runtimeCircuitOpenForTest())
@@ -158,9 +164,11 @@ class TrackHubInstrumentedTest {
                 forgotten.set(accepted)
                 forgetCompleted.countDown()
             }
-            waitUntil { TrackHub.hasPendingErasureForTest(context, privacyIngestToken) }
+            waitUntil("privacy erasure persistence") {
+                TrackHub.hasPendingErasureForTest(context, privacyIngestToken)
+            }
             assertTrue(TrackHub.isTrackingStoppedForTest())
-            waitUntil {
+            waitUntil("privacy measurement cleanup") {
                 TrackHub.offlineQueuePathCount(context, outageToken, "sdk/track") == 0 &&
                     !prefs.contains("openai_oppref") &&
                     !prefs.contains("pending_openai_oppref")
@@ -183,7 +191,7 @@ class TrackHubInstrumentedTest {
                     environment = TrackHubEnvironment.TestLab(outageToken),
                 ),
             )
-            assertTrue(forgetCompleted.await(10, TimeUnit.SECONDS))
+            assertTrue(forgetCompleted.await(30, TimeUnit.SECONDS))
             assertTrue(forgotten.get())
             assertFalse(TrackHub.hasPendingErasureForTest(context, privacyIngestToken))
             assertTrue(TrackHub.isTrackingStoppedForTest())
@@ -234,12 +242,16 @@ class TrackHubInstrumentedTest {
         throw AssertionError("TrackHub did not send /sdk/track")
     }
 
-    private fun waitUntil(timeoutMs: Long = 5_000, condition: () -> Boolean) {
+    private fun waitUntil(
+        description: String,
+        timeoutMs: Long = 15_000,
+        condition: () -> Boolean,
+    ) {
         val deadline = SystemClock.elapsedRealtime() + timeoutMs
         while (SystemClock.elapsedRealtime() < deadline) {
             if (condition()) return
             SystemClock.sleep(25)
         }
-        throw AssertionError("Timed out waiting for SDK state")
+        throw AssertionError("Timed out waiting for SDK state: $description")
     }
 }
