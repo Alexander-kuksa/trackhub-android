@@ -20,8 +20,8 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 @RunWith(AndroidJUnit4::class)
 class TrackHubInstrumentedTest {
@@ -37,13 +37,31 @@ class TrackHubInstrumentedTest {
             .putString("pending_gclid", "stale_google_click")
             .commit()
 
-        val trackAttempts = AtomicInteger(0)
         val allowTrackRecovery = AtomicBoolean(false)
+        val installRequest = AtomicReference<RecordedRequest?>()
+        val sessionRequest = AtomicReference<RecordedRequest?>()
+        val firstFailedTrackRequest = AtomicReference<RecordedRequest?>()
+        val lifecycleRequestsSeen = CountDownLatch(2)
+        val firstFailedTrackSeen = CountDownLatch(1)
+        val recoveredTrackSeen = CountDownLatch(1)
         val server = MockWebServer()
         server.dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
+                when {
+                    request.path?.endsWith("/install") == true &&
+                        installRequest.compareAndSet(null, request) -> lifecycleRequestsSeen.countDown()
+
+                    request.path?.endsWith("/sdk/session") == true &&
+                        sessionRequest.compareAndSet(null, request) -> lifecycleRequestsSeen.countDown()
+                }
                 val isTrack = request.path?.contains("/sdk/track") == true
-                if (isTrack) trackAttempts.incrementAndGet()
+                if (isTrack) {
+                    if (allowTrackRecovery.get()) {
+                        recoveredTrackSeen.countDown()
+                    } else if (firstFailedTrackRequest.compareAndSet(null, request)) {
+                        firstFailedTrackSeen.countDown()
+                    }
+                }
                 return if (isTrack && !allowTrackRecovery.get()) {
                     MockResponse().setResponseCode(500).setBody("{}")
                 } else MockResponse().setResponseCode(200).setBody("{}")
@@ -84,13 +102,22 @@ class TrackHubInstrumentedTest {
                 ),
             )
 
-            val opprefPayloads = waitForOpprefPayloads(server)
-            assertEquals("chatgpt-click-123", opprefPayloads.getValue("install").getString("oppref"))
-            assertEquals("chatgpt-click-123", opprefPayloads.getValue("session").getString("oppref"))
+            assertTrue(
+                "TrackHub did not send both oppref install and session payloads",
+                lifecycleRequestsSeen.await(120, TimeUnit.SECONDS),
+            )
+            val installBody = JSONObject(requireNotNull(installRequest.get()).body.readUtf8())
+            val sessionBody = JSONObject(requireNotNull(sessionRequest.get()).body.readUtf8())
+            assertEquals("chatgpt-click-123", installBody.getString("oppref"))
+            assertEquals("chatgpt-click-123", sessionBody.getString("oppref"))
 
             TrackHub.trackEvent("integration_probe", callbackParams = mapOf("screen" to "paywall"))
 
-            val firstTrack = waitForTrackRequest(server)
+            assertTrue(
+                "TrackHub did not send /sdk/track",
+                firstFailedTrackSeen.await(120, TimeUnit.SECONDS),
+            )
+            val firstTrack = requireNotNull(firstFailedTrackRequest.get())
             val body = JSONObject(firstTrack.body.readUtf8())
             assertEquals("integration_probe", body.getString("event_name"))
             assertEquals(testToken, body.getString("test_run_token"))
@@ -118,7 +145,10 @@ class TrackHubInstrumentedTest {
                     debugLogging = true,
                 ),
             )
-            waitForTrackRequest(server)
+            assertTrue(
+                "TrackHub did not retry /sdk/track after recovery",
+                recoveredTrackSeen.await(120, TimeUnit.SECONDS),
+            )
             waitUntil("offline queue recovery") {
                 TrackHub.offlineQueueCount(context, testToken) == 0
             }
@@ -228,29 +258,6 @@ class TrackHubInstrumentedTest {
             raw.toByteArray(Charsets.UTF_8),
             Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING,
         )
-    }
-
-    private fun waitForOpprefPayloads(server: MockWebServer): Map<String, JSONObject> {
-        val payloads = mutableMapOf<String, JSONObject>()
-        repeat(20) {
-            val request = server.takeRequest(1, TimeUnit.SECONDS) ?: return@repeat
-            val key = when {
-                request.path?.endsWith("/install") == true -> "install"
-                request.path?.endsWith("/sdk/session") == true -> "session"
-                else -> null
-            }
-            if (key != null) payloads[key] = JSONObject(request.body.readUtf8())
-            if (payloads.keys.containsAll(setOf("install", "session"))) return payloads
-        }
-        throw AssertionError("TrackHub did not send both oppref install and session payloads")
-    }
-
-    private fun waitForTrackRequest(server: MockWebServer): RecordedRequest {
-        repeat(12) {
-            val request = server.takeRequest(1, TimeUnit.SECONDS)
-            if (request != null && request.path?.contains("/sdk/track") == true) return request
-        }
-        throw AssertionError("TrackHub did not send /sdk/track")
     }
 
     private fun waitUntil(
