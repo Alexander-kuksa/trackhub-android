@@ -33,6 +33,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
+import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -96,7 +97,7 @@ enum class TrackHubSalesEvent(val value: String) {
 object TrackHub {
 
     /** SDK version reported to the platform for integration detection. */
-    const val SDK_VERSION = "2.0.3"
+    const val SDK_VERSION = "2.0.4"
 
     private const val PREFS = "trackhub"
     private const val INSTALL_SENT_KEY = "install_sent"
@@ -126,6 +127,7 @@ object TrackHub {
     private const val LEGACY_PENDING_ERASURE_PREFIX = "pending_erasure_"
     private const val APPHUD_USER_ID_PREFIX = "apphud_user_id_"
     private const val INSTALL_CREDENTIAL_BOOTSTRAP_PREFIX = "install_credential_bootstrap_"
+    private const val RUNTIME_CIRCUIT_MARKER_KEY = "runtime_circuit_last_run_v1"
     private const val AD_USER_DATA_KEY = "consent_ad_user_data"
     private const val AD_PERSONALIZATION_KEY = "consent_ad_personalization"
     private const val EEA_KEY = "consent_eea"
@@ -142,12 +144,22 @@ object TrackHub {
     private const val RETRY_BASE_MS = 1_000L
     private const val RETRY_MAX_MS = 5 * 60_000L
     private const val CREDENTIAL_BOOTSTRAP_INTERVAL_MS = 24 * 60 * 60_000L
-    private val io = Executors.newSingleThreadExecutor()
+    private val runtimeCircuitOpen = AtomicBoolean(false)
+
+    private enum class RuntimeCircuitReason(val wireValue: String) {
+        ALGORITHM("algorithm"),
+        STORAGE("storage"),
+        CREDENTIALS("credentials"),
+    }
+    private val rawIo = Executors.newSingleThreadExecutor()
+    private val io: Executor = failSilentExecutor("state", rawIo)
     // Network work must never occupy the state/persistence executor. New
     // events are durably spooled by `io` while this single delivery worker is
     // waiting on an unavailable TrackHub endpoint.
-    private val delivery = Executors.newSingleThreadExecutor()
-    private val auxiliaryNetwork = Executors.newFixedThreadPool(2)
+    private val rawDelivery = Executors.newSingleThreadExecutor()
+    private val delivery: Executor = failSilentExecutor("delivery", rawDelivery)
+    private val rawAuxiliaryNetwork = Executors.newFixedThreadPool(2)
+    private val auxiliaryNetwork: Executor = failSilentExecutor("auxiliary network", rawAuxiliaryNetwork)
     private val watchdog = Executors.newSingleThreadScheduledExecutor()
     private val privacyStateLock = Any()
     private val privacyCallbackLock = Any()
@@ -208,6 +220,10 @@ object TrackHub {
         context: Context,
         configuration: TrackHubConfig,
     ) {
+        if (runtimeCircuitOpen.get()) {
+            log("runtime circuit is open — SDK remains disabled until app restart")
+            return
+        }
         val decoded = DecodedTrackHubSdkKey.decode(configuration.sdkKey)
         val requestedTestToken = configuration.environment.testToken()
         if (decoded == null || (configuration.environment is TrackHubEnvironment.TestLab && requestedTestToken == null)) {
@@ -306,6 +322,7 @@ object TrackHub {
         }
         prefsEdit.apply()
         firstOpenAt(configuredAppContext)
+        reportRuntimeCircuitDiagnosticIfNeeded(configuredAppContext)
         runOnMain { registerLifecycle(configuredAppContext) }
         if (configuration.googleAdsConsent.adUserData == TrackHubConsentStatus.GRANTED) {
             runOnMain { runCatching { Apphud.collectDeviceIdentifiers() }.onFailure { log("Apphud identifier collection failed") } }
@@ -331,7 +348,9 @@ object TrackHub {
      */
     @JvmStatic
     fun updateFirebaseAppInstanceId(appInstanceId: String) {
-        if (!privacyStopRequested.get() && appInstanceId.isNotEmpty()) firebaseAppInstanceId = appInstanceId
+        if (!privacyStopRequested.get() && !runtimeCircuitOpen.get() && appInstanceId.isNotEmpty()) {
+            firebaseAppInstanceId = appInstanceId
+        }
     }
 
     /**
@@ -341,6 +360,7 @@ object TrackHub {
      */
     @JvmStatic
     fun updateCountryCode(countryCode: String) {
+        if (runtimeCircuitOpen.get()) return
         val value = normalizedCountryCode(countryCode) ?: return
         io.execute {
             val configured = appContext ?: return@execute
@@ -358,6 +378,7 @@ object TrackHub {
     /** Persist Consent Mode signals and re-report them when already configured. */
     @JvmStatic
     fun updateGoogleAdsConsent(consent: TrackHubGoogleAdsConsent) {
+        if (runtimeCircuitOpen.get()) return
         io.execute {
             val configured = appContext ?: return@execute
             if (trackingDisabled || hasPersistedPrivacyDisable(configured)) return@execute
@@ -373,6 +394,7 @@ object TrackHub {
     /** Persist mainland-China PIPL signals and re-report them when configured. */
     @JvmStatic
     fun updatePiplConsent(consent: TrackHubPiplConsent) {
+        if (runtimeCircuitOpen.get()) return
         io.execute {
             val configured = appContext ?: return@execute
             if (trackingDisabled || hasPersistedPrivacyDisable(configured)) return@execute
@@ -414,6 +436,7 @@ object TrackHub {
      */
     @JvmStatic
     fun setPushToken(context: Context, token: String) {
+        if (runtimeCircuitOpen.get()) return
         val value = token.trim()
         if (value.length !in 32..4096) return
         val configured = context.applicationContext
@@ -429,6 +452,10 @@ object TrackHub {
     /** Fetches the durable TrackHub attribution snapshot on the IO executor. */
     @JvmStatic
     fun attribution(completion: (TrackHubAttribution?) -> Unit) {
+        if (runtimeCircuitOpen.get()) {
+            runOnMainSafely("attribution completion") { completion(null) }
+            return
+        }
         currentAttribution?.let { current ->
             runOnMainSafely("attribution completion") { completion(current) }
             return
@@ -439,6 +466,10 @@ object TrackHub {
     /** Resolves a one-time TrackHub measurement-link deferred path. */
     @JvmStatic
     fun resolveDeferredDeepLink(completion: TrackHubDeferredDeepLinkHandler) {
+        if (runtimeCircuitOpen.get()) {
+            runOnMainSafely("deferred deep-link completion") { completion(null) }
+            return
+        }
         io.execute { resolveDeferredDeepLinkIfNeeded(completion) }
     }
 
@@ -521,7 +552,7 @@ object TrackHub {
         callbackParams: Map<String, *> = emptyMap<String, Any>(),
         partnerParams: Map<String, *> = emptyMap<String, Any>(),
     ) {
-        if (name.isBlank()) return
+        if (name.isBlank() || runtimeCircuitOpen.get()) return
         val callbackSnapshot = runCatching { callbackParams.toMap() }.getOrNull()
             ?: return log("trackEvent callbackParams could not be copied — skipped")
         val partnerSnapshot = runCatching { partnerParams.toMap() }.getOrNull()
@@ -531,7 +562,7 @@ object TrackHub {
         // immediately after start therefore waits for initialization
         // instead of observing half-configured state or being dropped.
         io.execute {
-            if (trackingDisabled) return@execute
+            if (trackingDisabled || runtimeCircuitOpen.get()) return@execute
             refreshApphudIdentity()
             val context = appContext ?: return@execute log("trackEvent before start — skipped")
             val uid = userId ?: return@execute log("trackEvent before start — skipped")
@@ -566,12 +597,14 @@ object TrackHub {
         callbackParams: Map<String, *> = emptyMap<String, Any>(),
         partnerParams: Map<String, *> = emptyMap<String, Any>(),
     ) {
+        if (runtimeCircuitOpen.get()) return
         val needsPlacement = event != TrackHubSalesEvent.ONBOARDING_SHOWN
         if (needsPlacement && placement == null) {
             log("${event.value} requires a canonical placement — skipped")
             return
         }
-        val canonical = callbackParams.toMutableMap()
+        val canonical = runCatching { callbackParams.toMutableMap() }.getOrNull()
+            ?: return log("sales event parameters could not be copied — skipped")
         if (placement != null) canonical["placement_name"] = placement.value
         trackEvent(event.value, canonical, partnerParams)
     }
@@ -584,8 +617,9 @@ object TrackHub {
     @JvmStatic
     @JvmOverloads
     fun trackPurchaseObserved(transactionId: String, productId: String? = null) {
-        if (transactionId.isBlank()) return
+        if (transactionId.isBlank() || runtimeCircuitOpen.get()) return
         io.execute {
+            if (runtimeCircuitOpen.get()) return@execute
             if (sdkSecret.isNullOrEmpty()) return@execute log("trackPurchaseObserved requires sdkSecret — skipped")
             val context = appContext ?: return@execute log("trackPurchaseObserved before start — skipped")
             val uid = userId ?: return@execute log("trackPurchaseObserved before start — skipped")
@@ -600,7 +634,8 @@ object TrackHub {
 
     /** Capture Google or ChatGPT Ads deep-link ids for the next session reattribution. */
     @JvmStatic
-    fun handleDeepLink(uri: Uri): Boolean = captureDeepLink(appContext, uri)
+    fun handleDeepLink(uri: Uri): Boolean =
+        if (runtimeCircuitOpen.get()) false else captureDeepLink(appContext, uri)
 
     /**
      * Cold-launch overload that persists click IDs before [start]. Prefer
@@ -608,7 +643,7 @@ object TrackHub {
      */
     @JvmStatic
     fun handleDeepLink(context: Context, uri: Uri): Boolean =
-        captureDeepLink(context.applicationContext, uri)
+        if (runtimeCircuitOpen.get()) false else captureDeepLink(context.applicationContext, uri)
 
     private fun captureDeepLink(context: Context?, uri: Uri): Boolean {
         if (trackingDisabled) {
@@ -845,7 +880,9 @@ object TrackHub {
         val delayMs = nextAttemptAtMs - System.currentTimeMillis()
         if (delayMs > 0) {
             if (job.optBoolean("launch_only", false)) return
-            watchdog.schedule({ io.execute { retryPendingErasure() } }, delayMs, TimeUnit.MILLISECONDS)
+            scheduleWatchdog("privacy retry", delayMs, TimeUnit.MILLISECONDS) {
+                io.execute { retryPendingErasure() }
+            }
             return
         }
         val installUid = job.optString("install_uid")
@@ -902,7 +939,9 @@ object TrackHub {
                     .put("launch_only", !retryable)
                 persistPendingErasure(context, job)
                 if (retryable) {
-                    watchdog.schedule({ io.execute { retryPendingErasure() } }, retryDelayMs, TimeUnit.MILLISECONDS)
+                    scheduleWatchdog("privacy retry", retryDelayMs, TimeUnit.MILLISECONDS) {
+                        io.execute { retryPendingErasure() }
+                    }
                     log("privacy erasure pending — retrying with backoff")
                 } else {
                     log("privacy erasure rejected — retry deferred until a later launch/foreground")
@@ -948,6 +987,7 @@ object TrackHub {
     }
 
     private fun beginSessionIfNeeded(context: Context, force: Boolean = false) {
+        if (runtimeCircuitOpen.get()) return
         val uid = userId ?: return
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val now = System.currentTimeMillis()
@@ -984,7 +1024,7 @@ object TrackHub {
     // MARK: - Install reporting
 
     private fun reportInstallIfNeeded(context: Context): Boolean {
-        if (trackingDisabled) return false
+        if (trackingDisabled || runtimeCircuitOpen.get()) return false
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val installUid = installUid(context)
         val installAlreadySent = prefs.getBoolean(INSTALL_SENT_KEY, false)
@@ -1028,8 +1068,10 @@ object TrackHub {
         }
         // Some vendor implementations neither connect nor disconnect. A
         // bounded fallback keeps the install/session queue moving as organic.
-        watchdog.schedule({ finishInitial(null) }, 3, TimeUnit.SECONDS)
-        watchdog.schedule({ runCatching { client.endConnection() } }, 30, TimeUnit.SECONDS)
+        scheduleWatchdog("install referrer fallback", 3, TimeUnit.SECONDS) { finishInitial(null) }
+        scheduleWatchdog("install referrer cleanup", 30, TimeUnit.SECONDS) {
+            runCatching { client.endConnection() }
+        }
         runCatching {
             client.startConnection(object : InstallReferrerStateListener {
                 override fun onInstallReferrerSetupFinished(responseCode: Int) {
@@ -1060,6 +1102,7 @@ object TrackHub {
         dedupeKey: String = "install",
         beginSession: Boolean = true,
     ) {
+        if (runtimeCircuitOpen.get()) return
         val uid = userId ?: return
         deferredMatchToken(referrer)?.let { matchToken ->
             prefs.edit().putString(DEFERRED_MATCH_TOKEN_KEY, matchToken).apply()
@@ -1225,7 +1268,7 @@ object TrackHub {
     // MARK: - Networking
 
     private fun fetchAttributionIfNeeded(completion: ((TrackHubAttribution?) -> Unit)? = null) {
-        if (trackingDisabled || attributionFetchInFlight || integrationTestToken != null) {
+        if (trackingDisabled || runtimeCircuitOpen.get() || attributionFetchInFlight || integrationTestToken != null) {
             completion?.let { callback ->
                 runOnMainSafely("attribution completion") { callback(null) }
             }
@@ -1275,10 +1318,10 @@ object TrackHub {
                 }
             }
         }
-        watchdog.schedule({
+        scheduleWatchdog("attribution timeout", CALLBACK_TIMEOUT_MS, TimeUnit.MILLISECONDS) {
             log("attribution fetch timed out")
             finish(null)
-        }, CALLBACK_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        }
         val networkConfig = currentNetworkConfig()
         if (networkConfig == null) {
             finish(null)
@@ -1353,7 +1396,7 @@ object TrackHub {
 
     /** Runs on `io`; Apphud identity is observed automatically, never supplied by the host. */
     private fun refreshApphudIdentity() {
-        if (trackingDisabled || privacyStopRequested.get()) return
+        if (trackingDisabled || runtimeCircuitOpen.get() || privacyStopRequested.get()) return
         val context = appContext ?: return
         val apphudId = apphudUserId() ?: return
         val previousRuntimeId = userId
@@ -1384,7 +1427,7 @@ object TrackHub {
     private fun resolveDeferredDeepLinkIfNeeded(
         completion: TrackHubDeferredDeepLinkHandler? = null,
     ) {
-        if (trackingDisabled || deferredResolveInFlight || integrationTestToken != null) {
+        if (trackingDisabled || runtimeCircuitOpen.get() || deferredResolveInFlight || integrationTestToken != null) {
             completion?.let { callback ->
                 runOnMainSafely("deferred deep-link completion") { callback(null) }
             }
@@ -1493,7 +1536,7 @@ object TrackHub {
         kind: String? = null,
         dedupeKey: String? = null,
     ): Boolean {
-        if (trackingDisabled) return false
+        if (trackingDisabled || runtimeCircuitOpen.get()) return false
         val context = appContext ?: return false
         val preparedBody = withIntegrationTestToken(rawBody)
         if (preparedBody.toByteArray(Charsets.UTF_8).size > MAX_REPORT_BYTES) {
@@ -1545,6 +1588,7 @@ object TrackHub {
         }
         if (!persistPending(context, queueKey, items)) {
             log("offline queue write failed — report skipped")
+            openRuntimeCircuit(RuntimeCircuitReason.STORAGE, "offline queue persistence")
             return false
         }
         val itemId = item.getString("id")
@@ -1749,7 +1793,7 @@ object TrackHub {
 
     // On `io`. Exactly one network request is in flight process-wide.
     private fun scheduleNextDelivery(context: Context) {
-        if (trackingDisabled || deliveryInFlight) return
+        if (trackingDisabled || runtimeCircuitOpen.get() || deliveryInFlight) return
         val queueKey = pendingReportsKey()
         val items = loadPending(context, queueKey)
         while (items.length() > 0) {
@@ -1780,13 +1824,13 @@ object TrackHub {
             retryGeneration += 1
             val generation = retryGeneration
             retryScheduledAtMs = targetAtMs
-            watchdog.schedule({
+            scheduleWatchdog("delivery retry", delayMs, TimeUnit.MILLISECONDS) {
                 io.execute {
                     if (retryGeneration != generation) return@execute
                     retryScheduledAtMs = 0L
                     scheduleNextDelivery(context)
                 }
-            }, delayMs, TimeUnit.MILLISECONDS)
+            }
             return
         }
         retryGeneration += 1
@@ -1811,6 +1855,7 @@ object TrackHub {
         code: Int,
         responseBody: String?,
     ) {
+        if (runtimeCircuitOpen.get()) return
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         if (code == 410 && isServerPrivacyStop(responseBody)) {
             privacyStopRequested.set(true)
@@ -1853,6 +1898,7 @@ object TrackHub {
             transientRetryNotBeforeMs = nextAttemptAtMs
             if (!persistPending(context, queueKey, items)) {
                 log("${pending.path} retry state could not be persisted")
+                openRuntimeCircuit(RuntimeCircuitReason.STORAGE, "offline retry state persistence")
             }
             log(if (correctedClock) "device clock corrected — retrying ${pending.path}" else "${pending.path} delivery failed — retrying with backoff")
             return
@@ -1861,7 +1907,11 @@ object TrackHub {
         items.remove(index)
         if (!persistPending(context, queueKey, items)) {
             log("${pending.path} delivery state could not be persisted")
+            openRuntimeCircuit(RuntimeCircuitReason.STORAGE, "offline delivery state persistence")
             return
+        }
+        if (code == 401) {
+            openRuntimeCircuit(RuntimeCircuitReason.CREDENTIALS, "SDK credentials rejected")
         }
         if (code in 200..299) {
             when (pending.kind) {
@@ -2198,9 +2248,152 @@ object TrackHub {
         return fmt.format(date)
     }
 
+    /**
+     * Contains recoverable failures at every SDK executor boundary. The circuit
+     * is process-local: durable reports stay on disk and the next clean app
+     * launch retries them. VM-fatal conditions (OOM, stack overflow, thread
+     * death) are rethrown because continuing the host process is not safe.
+     */
+    private fun failSilentExecutor(label: String, delegate: Executor): Executor = Executor { task ->
+        try {
+            delegate.execute { runFailSilent(label) { task.run() } }
+        } catch (failure: Exception) {
+            handleAlgorithmFailure(label, failure)
+        }
+    }
+
+    private inline fun runFailSilent(label: String, block: () -> Unit) {
+        try {
+            block()
+        } catch (failure: Exception) {
+            handleAlgorithmFailure(label, failure)
+        }
+    }
+
+    private fun handleAlgorithmFailure(label: String, failure: Exception) {
+        val firstOpen = runtimeCircuitOpen.compareAndSet(false, true)
+        currentAttribution = null
+        if (firstOpen) {
+            persistRuntimeCircuitMarker(RuntimeCircuitReason.ALGORITHM)
+            // Do not log throwable messages: host-supplied values or vendor
+            // details can contain identifiers. Class + boundary are enough.
+            log("runtime circuit opened at $label (${failure.javaClass.simpleName}) — measurement disabled until app restart")
+        }
+    }
+
+    private fun openRuntimeCircuit(reason: RuntimeCircuitReason, label: String) {
+        val firstOpen = runtimeCircuitOpen.compareAndSet(false, true)
+        currentAttribution = null
+        if (firstOpen) {
+            persistRuntimeCircuitMarker(reason)
+            log("runtime circuit opened at $label — measurement disabled until app restart")
+        }
+    }
+
+    private fun scheduleWatchdog(
+        label: String,
+        delay: Long,
+        unit: TimeUnit,
+        block: () -> Unit,
+    ) {
+        try {
+            watchdog.schedule({ runFailSilent(label, block) }, delay, unit)
+        } catch (failure: Exception) {
+            handleAlgorithmFailure(label, failure)
+        }
+    }
+
+    private fun persistRuntimeCircuitMarker(reason: RuntimeCircuitReason) {
+        val context = appContext ?: return
+        try {
+            val marker = JSONObject()
+                .put("id", UUID.randomUUID().toString())
+                .put("reason", reason.wireValue)
+                .put("occurred_at", iso8601(Date()))
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putString(RUNTIME_CIRCUIT_MARKER_KEY, marker.toString())
+                .apply()
+        } catch (_: Exception) {
+            // Best effort only: persisting the disabled state itself would
+            // turn a transient fault into a permanent SDK shutdown.
+        }
+    }
+
+    private fun reportRuntimeCircuitDiagnosticIfNeeded(context: Context) {
+        if (integrationTestToken != null) return
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val raw = prefs.getString(RUNTIME_CIRCUIT_MARKER_KEY, null) ?: return
+        val marker = try {
+            JSONObject(raw)
+        } catch (_: Exception) {
+            prefs.edit().remove(RUNTIME_CIRCUIT_MARKER_KEY).apply()
+            return
+        }
+        val id = marker.optString("id")
+        val reason = marker.optString("reason")
+        val occurredAt = marker.optString("occurred_at")
+        val validReason = RuntimeCircuitReason.entries.any { it.wireValue == reason }
+        val validId = try {
+            UUID.fromString(id)
+            true
+        } catch (_: Exception) {
+            false
+        }
+        if (!validId || !validReason || occurredAt.isBlank()) {
+            prefs.edit().remove(RUNTIME_CIRCUIT_MARKER_KEY).apply()
+            return
+        }
+        val body = JSONObject()
+            .put("id", id)
+            .put("sdk_source", "trackhub-android")
+            .put("sdk_version", SDK_VERSION)
+            .put("reason", reason)
+            .put("occurred_at", occurredAt)
+        if (sendOrQueue(
+                "sdk/diagnostic",
+                body.toString(),
+                kind = "sdk_runtime_diagnostic",
+                dedupeKey = "sdk_runtime:$id",
+            )
+        ) {
+            prefs.edit().remove(RUNTIME_CIRCUIT_MARKER_KEY).apply()
+        }
+    }
+
+    internal fun runtimeCircuitOpenForTest(): Boolean = runtimeCircuitOpen.get()
+
+    internal fun runFailSilentForTest(block: () -> Unit) {
+        runFailSilent("test", block)
+    }
+
+    internal fun openRuntimeCircuitForTest() {
+        openRuntimeCircuit(RuntimeCircuitReason.ALGORITHM, "test")
+    }
+
+    internal fun resetRuntimeCircuitForTest() {
+        runtimeCircuitOpen.set(false)
+        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            ?.edit()
+            ?.remove(RUNTIME_CIRCUIT_MARKER_KEY)
+            ?.commit()
+    }
+
     private fun runOnMain(block: () -> Unit) {
-        val looper = runCatching { Looper.getMainLooper() }.getOrNull()
-        if (looper == null) block() else Handler(looper).post(block)
+        val looper = try {
+            Looper.getMainLooper()
+        } catch (failure: Exception) {
+            handleAlgorithmFailure("main looper", failure)
+            return
+        }
+        val guarded = Runnable { runFailSilent("main callback", block) }
+        if (looper == null) guarded.run() else {
+            try {
+                Handler(looper).post(guarded)
+            } catch (failure: Exception) {
+                handleAlgorithmFailure("main callback dispatch", failure)
+            }
+        }
     }
 
     private fun runOnMainSafely(label: String, block: () -> Unit) {

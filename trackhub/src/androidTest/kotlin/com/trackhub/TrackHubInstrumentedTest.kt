@@ -144,6 +144,7 @@ class TrackHubInstrumentedTest {
             waitUntil(timeoutMs = 10_000) {
                 TrackHub.offlineQueuePathCount(context, outageToken, "sdk/track") >= 25
             }
+            assertFalse(TrackHub.runtimeCircuitOpenForTest())
 
             // Exercise a privacy action before the replacement sdkKey starts.
             // The durable job must belong to the app installation, survive the
@@ -152,6 +153,7 @@ class TrackHubInstrumentedTest {
             val privacySecret = "privacy-sdk-secret-with-enough-entropy-9012"
             val forgotten = AtomicBoolean(false)
             val forgetCompleted = CountDownLatch(1)
+            TrackHub.openRuntimeCircuitForTest()
             TrackHub.gdprForgetMe(context) { accepted ->
                 forgotten.set(accepted)
                 forgetCompleted.countDown()
@@ -173,6 +175,7 @@ class TrackHubInstrumentedTest {
 
             // The same durable erasure resumes after a later launch against a
             // healthy TrackHub server; tracking never turns back on meanwhile.
+            TrackHub.resetRuntimeCircuitForTest() // simulate a clean process launch
             TrackHub.start(
                 context,
                 TrackHubConfig(
@@ -193,6 +196,7 @@ class TrackHubInstrumentedTest {
             assertFalse(permissions.contains("com.google.android.gms.permission.AD_ID"))
             assertTrue(permissions.contains("android.permission.INTERNET"))
         } finally {
+            TrackHub.resetRuntimeCircuitForTest()
             TrackHub.clearOfflineQueueForTest(context, testToken)
             prefs.edit().clear().commit()
             server.shutdown()

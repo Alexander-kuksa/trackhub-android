@@ -1,6 +1,6 @@
 # TrackHub Android SDK 2.0
 
-> Current release: `2.0.3` · minSdk 26 · Java/JVM 17 · Kotlin 2.1 · Apphud 3.4.2
+> Current release: `2.0.4` · minSdk 26 · Java/JVM 17 · Kotlin 2.1 · Apphud 3.4.2
 
 TrackHub measures installs, automatic sessions and engagement events, captures Google/OpenAI click
 references, and automatically joins the installation to Apphud. It does not require an application
@@ -20,7 +20,7 @@ JitPack example:
 repositories { maven("https://jitpack.io") }
 
 dependencies {
-    implementation("com.github.Alexander-kuksa:trackhub-android:2.0.3")
+    implementation("com.github.Alexander-kuksa:trackhub-android:2.0.4")
 }
 ```
 
@@ -230,6 +230,7 @@ TrackHub does not initialize Firebase, request notification permission or show n
 | Install Referrer | 3-second watchdog falls back to organic; a late vendor result is sent as an attribution refinement |
 | Clock skew | trusted server time corrects signing only; event stays queued |
 | Corruption | queue is quarantined, not allowed to crash the app |
+| Runtime circuit | unexpected internal executor/state `Exception` or storage failure disables measurement until process restart; queue retained |
 | Privacy | immediate durable stop; retry survives process death/server outage |
 
 Install is queued before the first session. This prevents a slow/hung Install Referrer service from
@@ -245,3 +246,10 @@ gradle :trackhub:connectedDebugAndroidTest
 
 Use JDK 17 and an API 26+ emulator/physical device. The instrumentation suite includes a TrackHub
 outage, disk queue persistence, signed retries and privacy erasure across a later healthy start.
+
+The runtime circuit catches recoverable `Exception`s at SDK state, delivery,
+auxiliary-network, watchdog and internal main-thread boundaries. It never owns
+host callback failures and deliberately does not catch `Error`s such as OOM or
+stack overflow: a library cannot safely continue the host process after those
+conditions. The next valid production launch sends one signed, idempotent
+Health marker without user/device identifiers or exception text.

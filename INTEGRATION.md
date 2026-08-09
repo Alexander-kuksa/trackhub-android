@@ -27,7 +27,7 @@ them by identity/install/transaction without making the mobile app a financial s
 - compileSdk 34 or newer
 - Java/JVM 17
 - Kotlin 2.1-compatible toolchain
-- TrackHub Android 2.0.3
+- TrackHub Android 2.0.4
 - Apphud Android 3.4.2 or a compatible newer 3.x
 - SDK Signature enabled and a TrackHub SDK Key copied from Setup
 - Apphud webhook linked to the same TrackHub app
@@ -43,7 +43,7 @@ maven("https://jitpack.io")
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.Alexander-kuksa:trackhub-android:2.0.3")
+    implementation("com.github.Alexander-kuksa:trackhub-android:2.0.4")
 }
 ```
 
@@ -259,6 +259,14 @@ The SDK only forwards an existing token and never requests notification permissi
 - `gdprForgetMe` offline + process kill + online restart: no tracking resumes and erase completes;
 - SDK secret rotation: previous key accepted during grace, new key works immediately and its queue
   namespace adopts reports durably written under the prior key.
+- recoverable internal SDK algorithm/executor/storage exception: process-local circuit opens, measurement
+  becomes a no-op, durable queue is retained, and the next clean launch retries;
+- VM-fatal error (OOM, stack overflow, thread death) or binary/linking failure: not containable by an
+  in-process SDK and must remain visible as an application crash.
+
+After a circuit stop, the next valid production launch emits one signed,
+idempotent Health marker. It includes no user/device identifier or exception
+text; host callback failures remain the host application's responsibility.
 
 ## 14. Release checklist
 
@@ -283,7 +291,7 @@ The SDK only forwards an existing token and never requests notification permissi
 | Symptom | Check |
 |---|---|
 | SDK not detected | SDK Key/app, clean install, HTTPS, signature enabled |
-| session before install | use 2.0.3; install/referrer watchdog queues install first |
+| session before install | use 2.0.4; install/referrer watchdog queues install first |
 | Apphud revenue not joined | webhook app/secret, transaction id, identity binding |
 | deferred path missing | Play referrer contains TrackHub match token; install was acknowledged |
 | no GAID | consent, AD_ID permission, ads-identifier runtime, LAT |
