@@ -4,6 +4,11 @@ SDK 3 uses its durable `install_uid` as the internal measurement `user_id`.
 Billing identities are optional provider-scoped bindings and never rename the
 installation.
 
+Version 3.0.3 synchronously commits a newly generated `install_uid` before any
+report may use it. Commit failure opens the process-local storage circuit, so a
+hard kill cannot turn an acknowledged installation into a second identity on
+the next launch.
+
 ```kotlin
 TrackHub.start(applicationContext, TrackHubConfig(sdkKey = trackHubSdkKey))
 TrackHub.setExternalIdentity("apphud", Apphud.userId())
@@ -49,6 +54,30 @@ changes either Google consent value; the independent server default does.
 Public measurement, deep-link, consent, attribution, push-token, purchase
 context and erasure methods remain asynchronous. Sessions coalesce for 30
 minutes in background; a captured deep link can force a new session.
+
+## Optional engagement-event deduplication
+
+```kotlin
+TrackHub.trackEvent("tutorial_done", deduplicationId = "tutorial-v1")
+```
+
+Blank keys behave as absent, while nonblank keys over 256 UTF-8 bytes skip the
+event. iOS and Android derive `client_event_id` as `dedup1-` plus lowercase
+SHA-256 of
+`install_uid + NUL + event_name + NUL + trimmed_deduplication_id`. The scope is
+one installation and event name: a repeated host call on that installation is
+idempotent, while another installation cannot be suppressed. Omitting the key
+keeps the existing random event ID behavior. Shared fixture:
+
+```text
+install_uid: 11111111-2222-4333-8444-555555555555
+event_name: tutorial_done
+deduplication_id: order-42
+client_event_id: dedup1-9068017e11119b7a3c99163c1cb825e87ecda0542a4405cb526d506b941eb579
+```
+
+Deduplication lasts for the measurement-event retention window: 90 days by
+default, configurable at account level, and indefinite when retention is `0`.
 
 Money rules match the server contract: provider-only revenue is allowed, store
 verification is an optional trust upgrade, transaction-family ownership beats

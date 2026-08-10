@@ -170,6 +170,7 @@ object TrackHub {
     private val privacyStateLock = Any()
     private val privacyCallbackLock = Any()
     private val identityStateLock = Any()
+    private var volatileInstallUid: String? = null
 
     @Volatile private var endpoint: String? = null
     @Volatile private var ingestToken: String? = null
@@ -584,8 +585,16 @@ object TrackHub {
         name: String,
         callbackParams: Map<String, *> = emptyMap<String, Any>(),
         partnerParams: Map<String, *> = emptyMap<String, Any>(),
+        deduplicationId: String? = null,
     ) {
-        if (name.isBlank() || runtimeCircuitOpen.get()) return
+        val normalizedName = name.trim()
+        if (normalizedName.isEmpty() || runtimeCircuitOpen.get()) return
+        val normalizedDeduplicationId = deduplicationId?.trim()
+        if (!normalizedDeduplicationId.isNullOrEmpty()
+            && normalizedDeduplicationId.toByteArray(Charsets.UTF_8).size > 256
+        ) {
+            return log("trackEvent deduplicationId exceeds 256 UTF-8 bytes — skipped")
+        }
         val callbackSnapshot = runCatchingException { callbackParams.toMap() }.getOrNull()
             ?: return log("trackEvent callbackParams could not be copied — skipped")
         val partnerSnapshot = runCatchingException { partnerParams.toMap() }.getOrNull()
@@ -598,10 +607,14 @@ object TrackHub {
             if (trackingDisabled || runtimeCircuitOpen.get()) return@execute
             val context = appContext ?: return@execute log("trackEvent before start — skipped")
             val uid = installUid(context)
+            val clientEventId = normalizedDeduplicationId
+                ?.takeIf { it.isNotEmpty() }
+                ?.let { deduplicatedClientEventId(uid, normalizedName, it) }
+                ?: UUID.randomUUID().toString()
             val rawBody = runCatchingException {
                 val body = deviceContextBody(context)
-                    .put("client_event_id", UUID.randomUUID().toString())
-                    .put("event_name", name)
+                    .put("client_event_id", clientEventId)
+                    .put("event_name", normalizedName)
                     .put("user_id", uid)
                     .put("occurred_at", iso8601(Date()))
                 if (callbackSnapshot.isNotEmpty()) body.put("callback_params", JSONObject(callbackSnapshot))
@@ -628,6 +641,7 @@ object TrackHub {
         placement: TrackHubSalesPlacement? = null,
         callbackParams: Map<String, *> = emptyMap<String, Any>(),
         partnerParams: Map<String, *> = emptyMap<String, Any>(),
+        deduplicationId: String? = null,
     ) {
         if (runtimeCircuitOpen.get()) return
         val needsPlacement = event != TrackHubSalesEvent.ONBOARDING_SHOWN
@@ -638,7 +652,7 @@ object TrackHub {
         val canonical = runCatchingException { callbackParams.toMutableMap() }.getOrNull()
             ?: return log("sales event parameters could not be copied — skipped")
         if (placement != null) canonical["placement_name"] = placement.value
-        trackEvent(event.value, canonical, partnerParams)
+        trackEvent(event.value, canonical, partnerParams, deduplicationId)
     }
 
     /**
@@ -899,6 +913,11 @@ object TrackHub {
             edit.remove(INSTALL_UID_KEY).remove(INSTALL_SENT_KEY)
         }
         edit.commit()
+        synchronized(identityStateLock) {
+            volatileInstallUid = if (keepInstallCredential) {
+                prefs.getString(INSTALL_UID_KEY, null)?.takeIf { it.isNotBlank() }
+            } else null
+        }
         pendingGclid = null
         pendingGbraid = null
         pendingOpenAiOppref = null
@@ -2092,6 +2111,12 @@ object TrackHub {
     internal fun isTrackingStoppedForTest(): Boolean =
         trackingDisabled && privacyStopRequested.get()
 
+    internal fun installUidForTest(context: Context): String = installUid(context.applicationContext)
+
+    internal fun resetVolatileInstallUidForTest() = synchronized(identityStateLock) {
+        volatileInstallUid = null
+    }
+
     private fun withIntegrationTestToken(rawBody: String): String {
         val token = integrationTestToken ?: return rawBody
         return runCatchingException { JSONObject(rawBody).put("test_run_token", token).toString() }
@@ -2230,10 +2255,35 @@ object TrackHub {
 
     private fun installUid(context: Context): String = synchronized(identityStateLock) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        prefs.getString(INSTALL_UID_KEY, null)?.takeIf { it.isNotBlank() }?.let { return@synchronized it }
-        val value = UUID.randomUUID().toString()
-        prefs.edit().putString(INSTALL_UID_KEY, value).apply()
+        prefs.getString(INSTALL_UID_KEY, null)?.takeIf { it.isNotBlank() }?.let {
+            volatileInstallUid = it
+            return@synchronized it
+        }
+        val value = volatileInstallUid ?: UUID.randomUUID().toString()
+        volatileInstallUid = value
+        if (!prefs.edit().putString(INSTALL_UID_KEY, value).commit()) {
+            openRuntimeCircuit(RuntimeCircuitReason.STORAGE, "install identity persistence failed")
+            log("install identity is not durable — measurement disabled for this process")
+        }
         value
+    }
+
+    internal fun deduplicatedClientEventId(
+        installUid: String,
+        eventName: String,
+        deduplicationId: String,
+    ): String? {
+        val normalizedEventName = eventName.trim()
+        val normalized = deduplicationId.trim()
+        if (normalizedEventName.isEmpty()
+            || normalized.isEmpty()
+            || normalized.toByteArray(Charsets.UTF_8).size > 256
+        ) return null
+        val material = "$installUid\u0000$normalizedEventName\u0000$normalized"
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(material.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        return "dedup1-$digest"
     }
 
     internal fun isValidInstallCredential(token: String): Boolean =
