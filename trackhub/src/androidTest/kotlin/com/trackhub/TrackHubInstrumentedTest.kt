@@ -186,9 +186,11 @@ class TrackHubInstrumentedTest {
             // emulator can take more than an arbitrary wall-clock polling
             // budget for 25 commits, so wait for a FIFO marker on the actual
             // state executor before inspecting the durable queue.
+            val stateDrained = TrackHub.awaitStateIdleForTest(240_000)
             assertTrue(
-                "SDK state executor did not drain after server outage",
-                TrackHub.awaitStateIdleForTest(120_000),
+                "SDK state executor did not drain after server outage; " +
+                    "persisted ${TrackHub.offlineQueuePathCount(context, outageToken, "sdk/track")}/25 events",
+                stateDrained,
             )
             val queuedOutageEvents =
                 TrackHub.offlineQueuePathCount(context, outageToken, "sdk/track")
