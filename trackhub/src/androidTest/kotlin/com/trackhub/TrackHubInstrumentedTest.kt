@@ -26,6 +26,23 @@ import java.util.concurrent.atomic.AtomicReference
 @RunWith(AndroidJUnit4::class)
 class TrackHubInstrumentedTest {
     @Test
+    fun installIdentityIsCommittedBeforeItCanBeUsed() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val prefs = context.getSharedPreferences("trackhub", Context.MODE_PRIVATE)
+        prefs.edit().remove("install_uid").commit()
+        TrackHub.resetRuntimeCircuitForTest()
+        TrackHub.resetVolatileInstallUidForTest()
+
+        val created = TrackHub.installUidForTest(context)
+        assertEquals(created, prefs.getString("install_uid", null))
+
+        // Simulate a new process-level read: the stable value must come from
+        // the synchronously committed preference, not volatile memory.
+        TrackHub.resetVolatileInstallUidForTest()
+        assertEquals(created, TrackHub.installUidForTest(context))
+    }
+
+    @Test
     fun signedTestLabPayloadRetriesOfflineWithoutAdvertisingIdPermission() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val testToken = "test-run-token-with-enough-entropy-1234"

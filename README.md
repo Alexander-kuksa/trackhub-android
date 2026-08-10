@@ -49,6 +49,17 @@ verification is optional. For Google App Conversion matching, forward a
 successful Play purchase with `trackPurchaseObserved`; it sends transaction ID
 and short-lived device context, never value or currency.
 
+For a host retry of one logical engagement event, use the optional stable key:
+
+```kotlin
+TrackHub.trackEvent("tutorial_done", deduplicationId = "tutorial-v1")
+```
+
+The key is trimmed, capped at 256 UTF-8 bytes and scoped to the installation
+plus event name. Without it, every call is a separate event. Server
+deduplication lasts for the measurement-event retention window: 90 days by
+default, account-configured, or indefinite when retention is `0`.
+
 ```kotlin
 TrackHub.updateGoogleAdsConsent(currentGoogleConsent)
 TrackHub.updatePiplConsent(currentPiplConsent)
@@ -76,6 +87,10 @@ The disk-first bounded queue protects install and transaction context. Network
 outages retry and do not trip the runtime circuit. Internal storage/codec/
 invariant failures disable measurement only for the current process; privacy
 erasure remains operational.
+
+Android synchronously commits `install_uid` before it can enter a report. If
+that commit fails, the process-local storage circuit opens and measurement is
+not sent with a non-durable identity.
 
 TrackHub must run in the application's main process. Exclude TrackHub state from
 backup/device transfer with the XML rules shipped by the library.
