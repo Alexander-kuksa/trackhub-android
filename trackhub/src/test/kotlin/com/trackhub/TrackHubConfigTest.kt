@@ -1,10 +1,21 @@
 package com.trackhub
 
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TrackHubConfigTest {
+    @Test
+    fun googleAdsConsentIsOptionalAndDoesNotInferEitherSignal() {
+        val consent = TrackHubGoogleAdsConsent()
+
+        assertEquals(TrackHubConsentStatus.UNKNOWN, consent.adUserData)
+        assertEquals(TrackHubConsentStatus.UNKNOWN, consent.adPersonalization)
+        assertNull(consent.isEea)
+    }
+
     @Test
     fun toStringRedactsSdkKeyAndFirebaseIdentifier() {
         val sdkKey = "thcfg_v1_super-secret-material"

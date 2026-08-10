@@ -1,7 +1,7 @@
 # TrackHub Android SDK 3.0
 
-> Current public release: `3.0.2` · matching Daively `/install` geography
-> contract is live and verified · minSdk 26 · Java/JVM 17
+> Current public release: `3.0.3` · measurement geography is server-owned
+> and is not cached by the SDK · minSdk 26 · Java/JVM 17
 
 TrackHub measures installations, 30-minute sessions, engagement and bounded
 Google/OpenAI click context. Apphud, RevenueCat and other billing SDKs remain
@@ -12,7 +12,7 @@ entirely owned by the host application.
 ```kotlin
 repositories { maven("https://jitpack.io") }
 dependencies {
-    implementation("com.github.Alexander-kuksa:trackhub-android:3.0.2")
+    implementation("com.github.Alexander-kuksa:trackhub-android:3.0.3")
 }
 ```
 
@@ -57,14 +57,20 @@ TrackHub.gdprForgetMe(applicationContext)
 ```
 
 Country is optional actual measurement geography, not language, and is not read
-from Apphud. From 3.0.2, a successful production install response may return
-trusted-edge `country` / `eea`; the SDK validates and durably caches them for
-later payloads. `countryCode` is only an initial host fallback and may be
-replaced by that result. Host EEA true OR cached EEA true stays protective;
-cached false cannot narrow host true. TrackHub does not infer geography from
-Locale or GPS and never discovers, persists or sends an IP address. The server
-still re-evaluates every request and remains authoritative. Unknown consent is
-never treated as granted.
+from Apphud. `countryCode` is only a host-provided request fallback. Daively
+resolves current geography on every official SDK delivery from its trusted edge
+or local country-only GeoIP database, then falls back to the host value and the
+stored installation country. The response never returns `country` or `eea` to
+the SDK. Version 3.0.3 deletes the short-lived geography cache and refresh job
+introduced in 3.0.2. TrackHub does not infer geography from Locale or GPS and
+never discovers, persists or sends an IP address. Both Google consent values
+stay `UNKNOWN` in the no-CMP SDK configuration; the public consent API is
+optional. Daively applies the approved app policy server-side: missing values
+default to `GRANTED` globally, including confirmed EEA and unknown geography.
+Explicit CMP denial always wins. Confirmed-EEA and unknown-geo grants are
+separately observable and have operator kill switches. Advertising-ID
+availability does not itself grant either Google consent signal; the server
+policy does. TrackHub shows no additional consent UI.
 
 The disk-first bounded queue protects install and transaction context. Network
 outages retry and do not trip the runtime circuit. Internal storage/codec/
