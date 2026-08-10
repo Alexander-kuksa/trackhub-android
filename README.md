@@ -1,6 +1,6 @@
 # TrackHub Android SDK 3.0
 
-> Current release: `3.0.0` · minSdk 26 · Java/JVM 17 · no billing-SDK dependency
+> Current release: `3.0.1` · minSdk 26 · Java/JVM 17 · no billing-SDK dependency
 
 TrackHub measures installations, 30-minute sessions, engagement and bounded
 Google/OpenAI click context. Apphud, RevenueCat and other billing SDKs remain
@@ -11,7 +11,7 @@ entirely owned by the host application.
 ```kotlin
 repositories { maven("https://jitpack.io") }
 dependencies {
-    implementation("com.github.Alexander-kuksa:trackhub-android:3.0.0")
+    implementation("com.github.Alexander-kuksa:trackhub-android:3.0.1")
 }
 ```
 
@@ -37,7 +37,9 @@ TrackHub.setExternalIdentity("revenuecat", Purchases.sharedInstance.appUserID)
 Repeat the identity call after login/logout/restore; pass `null` to clear one
 provider. Supported namespaces are `apphud`, `revenuecat`, `custom:<slug>`.
 TrackHub imports none of them, so billing startup order and version resolution
-are not TrackHub constraints.
+are not TrackHub constraints. The desired link is persisted immediately, while
+delivery waits for the production install acknowledgement. Version 3.0.1 also
+self-heals queues created by the 3.0.0 identity/install ordering defect.
 
 ## Purchases, consent and privacy
 

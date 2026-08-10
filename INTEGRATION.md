@@ -14,6 +14,9 @@ TrackHub.setExternalIdentity("revenuecat", Purchases.sharedInstance.appUserID)
 The host owns all billing imports and calls. TrackHub contains no Apphud /
 RevenueCat dependency, reflection or version probing. A provider logout is
 `setExternalIdentity(provider, null)` and affects no other provider.
+The desired identity is persisted immediately, but production delivery waits
+for the install acknowledgement. Test Lab remains independent. Version 3.0.1
+also lets a queued production install pass a blocked 3.0.0 identity head.
 
 Public measurement, deep-link, consent, attribution, push-token, purchase
 context and erasure methods remain asynchronous. Sessions coalesce for 30

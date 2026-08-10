@@ -94,7 +94,7 @@ enum class TrackHubSalesEvent(val value: String) {
 object TrackHub {
 
     /** SDK version reported to the platform for integration detection. */
-    const val SDK_VERSION = "3.0.0"
+    const val SDK_VERSION = "3.0.1"
 
     private const val PREFS = "trackhub"
     private const val INSTALL_SENT_KEY = "install_sent"
@@ -1407,6 +1407,14 @@ object TrackHub {
         if (trackingDisabled || runtimeCircuitOpen.get() || privacyStopRequested.get()) return
         if (normalizedExternalProvider(provider) != provider) return
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (!shouldEnqueueExternalIdentity(
+                installAcknowledged = prefs.getBoolean(INSTALL_SENT_KEY, false),
+                integrationTest = integrationTestToken != null,
+            )
+        ) {
+            log("external identity waiting for install acknowledgement")
+            return
+        }
         val fingerprint = externalIdentityFingerprint(provider, userId)
         val acknowledged = runCatchingException {
             JSONObject(prefs.getString(EXTERNAL_IDENTITY_ACK_KEY, "{}") ?: "{}")
@@ -1426,6 +1434,11 @@ object TrackHub {
             dedupeKey = "external_identity:$provider",
         )
     }
+
+    internal fun shouldEnqueueExternalIdentity(
+        installAcknowledged: Boolean,
+        integrationTest: Boolean,
+    ): Boolean = integrationTest || installAcknowledged
 
     private fun resolveDeferredDeepLinkIfNeeded(
         completion: TrackHubDeferredDeepLinkHandler? = null,
@@ -1622,6 +1635,18 @@ object TrackHub {
         return 0
     }
 
+    /**
+     * Preserve FIFO except when repairing the SDK 3.0.0 queue ordering bug:
+     * the server cannot accept an external identity before its production
+     * install, so let that one-shot anchor pass a blocked identity head.
+     */
+    internal fun preferredPendingDeliveryIndex(kinds: List<String?>): Int {
+        if (kinds.isEmpty()) return -1
+        if (kinds.first() != "external_identity") return 0
+        val installIndex = kinds.indexOfFirst { it == "production_install" }
+        return if (installIndex >= 0) installIndex else 0
+    }
+
     private fun pendingQueueFile(context: Context, queueKey: String): File =
         File(context.noBackupFilesDir, "trackhub-$queueKey.json")
 
@@ -1802,7 +1827,11 @@ object TrackHub {
             items.remove(0)
             persistPending(context, queueKey, items)
         }
-        val raw = items.optJSONObject(0) ?: return
+        val kinds = (0 until items.length()).map { index ->
+            items.optJSONObject(index)?.optString("kind")?.takeIf { it.isNotEmpty() }
+        }
+        val deliveryIndex = preferredPendingDeliveryIndex(kinds)
+        val raw = items.optJSONObject(deliveryIndex) ?: return
         val pending = PendingDelivery(
             id = raw.optString("id").takeIf { it.isNotEmpty() } ?: UUID.randomUUID().toString(),
             path = raw.optString("path"),
@@ -1815,7 +1844,8 @@ object TrackHub {
             raw.put("id", pending.id)
             persistPending(context, queueKey, items)
         }
-        val targetAtMs = maxOf(pending.nextAttemptAtMs, transientRetryNotBeforeMs)
+        val transientNotBeforeMs = if (deliveryIndex == 0) transientRetryNotBeforeMs else 0L
+        val targetAtMs = maxOf(pending.nextAttemptAtMs, transientNotBeforeMs)
         val delayMs = targetAtMs - System.currentTimeMillis()
         if (delayMs > 0) {
             if (retryScheduledAtMs != 0L && retryScheduledAtMs <= targetAtMs) return
@@ -1917,6 +1947,7 @@ object TrackHub {
                     prefs.edit().putBoolean(INSTALL_SENT_KEY, true).commit()
                     saveInstallCredential(context, responseBody)
                     log("install reported")
+                    syncPersistedExternalIdentities(context)
                     sendConsentUpdate(context)
                     fetchAttributionIfNeeded()
                     resolveDeferredDeepLinkIfNeeded()

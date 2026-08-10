@@ -55,14 +55,19 @@ class TrackHubInstrumentedTest {
                         sessionRequest.compareAndSet(null, request) -> lifecycleRequestsSeen.countDown()
                 }
                 val isTrack = request.path?.contains("/sdk/track") == true
+                // Snapshot the response decision before releasing the test
+                // thread. Otherwise it can flip allowTrackRecovery between
+                // the latch countdown and the return below, turning the first
+                // request into a 200 while the test still waits for a retry.
+                val shouldFailTrack = isTrack && !allowTrackRecovery.get()
                 if (isTrack) {
-                    if (allowTrackRecovery.get()) {
+                    if (!shouldFailTrack) {
                         recoveredTrackSeen.countDown()
                     } else if (firstFailedTrackRequest.compareAndSet(null, request)) {
                         firstFailedTrackSeen.countDown()
                     }
                 }
-                return if (isTrack && !allowTrackRecovery.get()) {
+                return if (shouldFailTrack) {
                     MockResponse().setResponseCode(500).setBody("{}")
                 } else MockResponse().setResponseCode(200).setBody("{}")
             }
