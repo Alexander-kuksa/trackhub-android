@@ -30,7 +30,17 @@ jobs:
         with:
           api-level: 34
           arch: x86_64
-          script: gradle :trackhub:connectedDebugAndroidTest --no-daemon --stacktrace
+          # GitHub's emulator occasionally loses its adb daemon before or
+          # during instrumentation (the same commit then passes on the tag
+          # runner). Retry exactly once after rebuilding the adb connection;
+          # a deterministic SDK/test failure still fails both attempts.
+          script: |
+            gradle :trackhub:connectedDebugAndroidTest --no-daemon --stacktrace || {
+              adb kill-server || true
+              adb start-server
+              adb wait-for-device
+              gradle :trackhub:connectedDebugAndroidTest --rerun-tasks --no-daemon --stacktrace
+            }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
