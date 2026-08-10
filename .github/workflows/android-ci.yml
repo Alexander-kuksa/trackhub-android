@@ -34,13 +34,7 @@ jobs:
           # during instrumentation (the same commit then passes on the tag
           # runner). Retry exactly once after rebuilding the adb connection;
           # a deterministic SDK/test failure still fails both attempts.
-          script: |
-            gradle :trackhub:connectedDebugAndroidTest --no-daemon --stacktrace || {
-              adb kill-server || true
-              adb start-server
-              adb wait-for-device
-              gradle :trackhub:connectedDebugAndroidTest --rerun-tasks --no-daemon --stacktrace
-            }
+          script: bash .github/run-android-device-tests.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
