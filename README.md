@@ -1,7 +1,7 @@
 # TrackHub Android SDK 3.0
 
-> Current public release: `3.0.1` · next patch `3.0.2` is gated on the matching
-> Daively `/install` geography contract · minSdk 26 · Java/JVM 17
+> Current public release: `3.0.2` · matching Daively `/install` geography
+> contract is live and verified · minSdk 26 · Java/JVM 17
 
 TrackHub measures installations, 30-minute sessions, engagement and bounded
 Google/OpenAI click context. Apphud, RevenueCat and other billing SDKs remain
@@ -12,7 +12,7 @@ entirely owned by the host application.
 ```kotlin
 repositories { maven("https://jitpack.io") }
 dependencies {
-    implementation("com.github.Alexander-kuksa:trackhub-android:3.0.1")
+    implementation("com.github.Alexander-kuksa:trackhub-android:3.0.2")
 }
 ```
 
