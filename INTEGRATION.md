@@ -1,300 +1,39 @@
-# TrackHub Android SDK 2.0 — developer integration guide
+# TrackHub Android 3.0 integration reference
 
-This is the canonical native Android implementation guide. Apphud is assumed to be present and
-authoritative for subscription revenue. No application backend or login is required.
-
-## 1. Architecture
-
-```text
-Android app
-  Apphud SDK ───────────────► Apphud ── webhook ──► TrackHub
-       ▲                                                │
-       │ automatic custom attribution                   │ revenue join
-       │                                                ▼
-  TrackHub SDK ─ install/session/events/context ──► TrackHub
-                                                    ├─ Google App Conversion API
-                                                    ├─ Google Data Manager/offline import
-                                                    ├─ ChatGPT Ads CAPI
-                                                    └─ product analytics
-```
-
-The SDK measures the device. Apphud reports verified billing lifecycle and money. TrackHub joins
-them by identity/install/transaction without making the mobile app a financial source.
-
-## 2. Requirements
-
-- minSdk 26
-- compileSdk 34 or newer
-- Java/JVM 17
-- Kotlin 2.1-compatible toolchain
-- TrackHub Android 2.0.6
-- Apphud Android 3.4.2 or a compatible newer 3.x
-- SDK Signature enabled and a TrackHub SDK Key copied from Setup
-- Apphud webhook linked to the same TrackHub app
-
-SDK 2.0 removes legacy `configure`, `setUserId`, Apphud adapters and backend callbacks. Old mobile
-API source compatibility is intentionally not retained.
-
-## 3. Gradle
+SDK 3 uses its durable `install_uid` as the internal measurement `user_id`.
+Billing identities are optional provider-scoped bindings and never rename the
+installation.
 
 ```kotlin
-// settings.gradle.kts or repositories block
-maven("https://jitpack.io")
-
-// app/build.gradle.kts
-dependencies {
-    implementation("com.github.Alexander-kuksa:trackhub-android:2.0.6")
-}
+TrackHub.start(applicationContext, TrackHubConfig(sdkKey = trackHubSdkKey))
+TrackHub.setExternalIdentity("apphud", Apphud.userId())
+// or
+TrackHub.setExternalIdentity("revenuecat", Purchases.sharedInstance.appUserID)
 ```
 
-For TrackHub GAID/App Set collection add the Google artifacts listed in README and, only when your
-policy requires it:
+The host owns all billing imports and calls. TrackHub contains no Apphud /
+RevenueCat dependency, reflection or version probing. A provider logout is
+`setExternalIdentity(provider, null)` and affects no other provider.
 
-```xml
-<uses-permission android:name="com.google.android.gms.permission.AD_ID" />
-```
+Public measurement, deep-link, consent, attribution, push-token, purchase
+context and erasure methods remain asynchronous. Sessions coalesce for 30
+minutes in background; a captured deep link can force a new session.
 
-Run TrackHub only in the application's main process. If the app declares services or providers in
-other processes, do not call `TrackHub.start` or any tracking API from them.
+Money rules match the server contract: provider-only revenue is allowed, store
+verification is an optional trust upgrade, transaction-family ownership beats
+device activity, and explicit Family Sharing does not count or forward.
 
-The SDK's `trackhub.xml` preferences contain installation identifiers and must not move to another
-device through backup/restore. Merge the exclusions from the packaged
-`@xml/trackhub_backup_rules` and `@xml/trackhub_data_extraction_rules` into the host application's
-backup policy. A direct manifest reference is sufficient when the host has no other rules:
+Release verification:
 
-```xml
-<application
-    android:fullBackupContent="@xml/trackhub_backup_rules"
-    android:dataExtractionRules="@xml/trackhub_data_extraction_rules" />
-```
+1. Confirm dependency resolution contains no billing SDK through TrackHub.
+2. Run a clean Test Lab install and verify install precedes session.
+3. Exercise provider anonymous ID, login, logout and restore.
+4. Verify Apphud 3.6.2 (QR Scanner canary) compiles without TrackHub conflicts.
+5. Test 29:59/30:01 session boundaries and forced deep-link session.
+6. Test a sandbox purchase plus authenticated provider webhook.
+7. Test airplane mode, process death and exactly-once queue drain.
+8. Test offline `gdprForgetMe` and relaunch.
+9. Confirm SDK Key, install credential and external IDs are absent from logs.
 
-### Google Play Data safety
-
-The host app owns the final Play Console declaration. Review the enabled TrackHub features and the
-server forwarding configuration instead of copying a static answer. The baseline integration sends
-app interactions, app/version/device metadata, an installation/user identifier, country when the
-host supplies it, consent state and purchase transaction identifiers to the developer-operated
-Daively service for analytics and fraud prevention. Optional features add advertising ID, push
-token, crash/diagnostic context, purchase history and campaign/deep-link identifiers. Declare data
-sharing when Daively forwards consented events to Google Ads/GA4 or another configured provider,
-and document account deletion/erasure using `gdprForgetMe`. TrackHub does not collect contacts,
-messages, photos, audio, precise location, health or financial-account credentials.
-
-## 4. Application startup
-
-Cold-start order:
-
-1. forward the launch `Intent.data` if present;
-2. restore CMP consent state;
-3. start Apphud;
-4. construct `TrackHubConfig` from one copied SDK Key;
-5. call `TrackHub.start`;
-6. do not wait for TrackHub before drawing the first UI.
-
-```kotlin
-class ExampleApplication : Application() {
-    override fun onCreate() {
-        super.onCreate()
-
-        Apphud.start(applicationContext, BuildConfig.APPHUD_API_KEY)
-
-        TrackHub.start(
-            applicationContext,
-            TrackHubConfig(
-                sdkKey = BuildConfig.TRACKHUB_SDK_KEY,
-                countryCode = countryProvider.measurementCountry,
-                collectAdvertisingId = consentStore.adUserData,
-                firebaseAppInstanceId = firebaseAppInstanceId,
-                googleAdsConsent = consentStore.trackHubGoogleConsent(),
-                piplConsent = consentStore.trackHubPiplConsent(),
-                attributionChangedHandler = { snapshot ->
-                    mainState.onAttribution(snapshot)
-                },
-                deferredDeepLinkHandler = { path ->
-                    path?.let(router::open)
-                },
-            ),
-        )
-    }
-}
-```
-
-TrackHub starts asynchronously. SharedPreferences migration, disk queue work, Install Referrer and
-network access do not block `Application.onCreate`.
-
-## 5. Identity behavior
-
-The host does not pass identity. TrackHub reads `Apphud.userId()` and uses an app-scoped fallback
-only until Apphud is ready. On foreground/event boundaries it checks again. If restore/login changes
-the Apphud id, the SDK sends a signed `sdk/identity` update tied to the same `install_uid`; the server
-closes the old binding and preserves its history instead of creating a second install.
-
-Apphud attribution delivery is built in through the official
-`Apphud.setAttribution(ApphudAttributionData(...), CUSTOM)` API. TrackHub never starts Apphud.
-
-## 6. Consent
-
-Map all three states explicitly:
-
-```kotlin
-fun ConsentStore.trackHubGoogleConsent() = TrackHubGoogleAdsConsent(
-    adUserData = when (adUserDataState) {
-        YES -> TrackHubConsentStatus.GRANTED
-        NO -> TrackHubConsentStatus.DENIED
-        UNRESOLVED -> TrackHubConsentStatus.UNKNOWN
-    },
-    adPersonalization = /* same mapping */,
-    isEea = geo.isEea,
-)
-```
-
-After settings/CMP change call `updateGoogleAdsConsent` and/or `updatePiplConsent`. `UNKNOWN` omits
-the field. It must not be silently treated as granted.
-
-## 7. Activity/deep-link wiring
-
-For the first Activity:
-
-```kotlin
-override fun onCreate(savedInstanceState: Bundle?) {
-    intent?.data?.let { TrackHub.handleDeepLink(applicationContext, it) }
-    super.onCreate(savedInstanceState)
-}
-
-override fun onNewIntent(intent: Intent) {
-    super.onNewIntent(intent)
-    intent.data?.let { TrackHub.handleDeepLink(it) }
-}
-```
-
-The SDK reads Google Play Install Referrer asynchronously. A 3-second watchdog falls back to organic
-if a vendor service hangs. The install payload enters the durable queue before the first session, and
-deferred resolution waits for the install, eliminating click-consumption races.
-
-## 8. Event instrumentation
-
-```kotlin
-TrackHub.trackSalesEvent(TrackHubSalesEvent.ONBOARDING_SHOWN)
-TrackHub.trackSalesEvent(TrackHubSalesEvent.PAYWALL_SHOWN, TrackHubSalesPlacement.ONBOARDING)
-TrackHub.trackSalesEvent(TrackHubSalesEvent.PURCHASE_CTA_TAPPED, TrackHubSalesPlacement.ONBOARDING)
-TrackHub.trackEvent("tutorial_completed", mapOf("variant" to "short"))
-```
-
-Instrumentation rules:
-
-- fire visibility events when the screen is actually visible;
-- fire CTA before billing begins;
-- use stable names and bounded JSON-safe parameters;
-- do not include email, phone, user text or other PII;
-- do not emit client revenue or mirror Apphud lifecycle events.
-
-## 9. Purchase context
-
-```kotlin
-fun onVerifiedPurchase(purchase: Purchase) {
-    TrackHub.trackPurchaseObserved(
-        transactionId = purchase.orderId ?: return,
-        productId = purchase.products.firstOrNull(),
-    )
-}
-```
-
-Use only for enabled Google App Conversion purchase mappings. It is not needed for TrackHub revenue
-analytics itself. Apphud webhook value/currency wins; unmatched context expires after 72 hours.
-
-## 10. Privacy
-
-Wire the user-facing device measurement deletion action directly:
-
-```kotlin
-TrackHub.gdprForgetMe(applicationContext)
-```
-
-Always pass `applicationContext`: this overload persists the stop and erasure
-job even when privacy is requested before `TrackHub.start`. SDK Key rotation
-does not reset the app-install-scoped privacy state.
-
-The call synchronously sets an atomic stop and persists a small job before asynchronous cleanup.
-Events buffered before the action are removed. Server/network errors do not re-enable tracking. The
-job retries on launch/foreground using the device install token or a signed privacy-only recovery.
-
-The optional completion reports server confirmation when the process stays alive. Product UI should
-not wait for it to claim that local tracking stopped.
-
-For authenticated account-wide deletion, call the TrackHub server/admin API from trusted backend
-infrastructure. Never embed an S2S key in Android.
-
-## 11. FCM
-
-```kotlin
-class MessagingService : FirebaseMessagingService() {
-    override fun onNewToken(token: String) {
-        TrackHub.setPushToken(applicationContext, token)
-    }
-}
-```
-
-The SDK only forwards an existing token and never requests notification permission.
-
-## 12. Test Lab
-
-1. start an isolated test in TrackHub;
-2. copy the generated Test Lab config;
-3. clear app data or reinstall;
-4. launch, enter/leave foreground, show a paywall, fire a custom event;
-5. complete an Apphud sandbox purchase if the mapping is under test;
-6. verify signature, install, session, identity, event and join timeline;
-7. confirm isolated mode did not call Google;
-8. run live Google canary only after explicit approval.
-
-## 13. Crash/outage test matrix
-
-- server closed/DNS failure: application stays responsive, queue grows within bounds;
-- 500/429: full-jitter retry, no tight loop;
-- process kill after enqueue: report survives under `noBackupFilesDir`;
-- process kill after ACK: possible duplicate is server-deduplicated;
-- corrupt queue: file is quarantined and host does not crash;
-- hung Install Referrer: organic fallback after watchdog;
-- wrong device clock: signed event stays queued and uses trusted clock correction;
-- `gdprForgetMe` offline + process kill + online restart: no tracking resumes and erase completes;
-- SDK secret rotation: previous key accepted during grace, new key works immediately and its queue
-  namespace adopts reports durably written under the prior key.
-- recoverable internal SDK algorithm/executor/storage exception: process-local circuit opens, measurement
-  becomes a no-op, durable queue is retained, and the next clean launch retries;
-- VM-fatal error (OOM, stack overflow, thread death) or binary/linking failure: not containable by an
-  in-process SDK and must remain visible as an application crash.
-
-After a circuit stop, the next valid production launch emits one signed,
-idempotent Health marker. It includes no user/device identifier or exception
-text; host callback failures remain the host application's responsibility.
-
-## 14. Release checklist
-
-- [ ] API 26+, Java 17, Kotlin 2.1-compatible build
-- [ ] one compatible Apphud dependency resolves
-- [ ] Apphud starts before TrackHub
-- [ ] SDK Key never appears in logs/URLs/analytics
-- [ ] TrackHub runs only in the application main process
-- [ ] `trackhub.xml` is excluded from cloud backup and device transfer
-- [ ] Play Data safety answers match the enabled identifiers, purchase events and forwarding providers
-- [ ] consent mapping distinguishes unknown/denied/granted
-- [ ] actual country is supplied when known
-- [ ] launch/runtime intents are forwarded
-- [ ] event names/placements match the catalog
-- [ ] no client-authored revenue is sent
-- [ ] privacy action tested across offline process restart
-- [ ] unit and connected instrumentation tests pass
-- [ ] TrackHub Test Lab passes on the release candidate
-
-## 15. Troubleshooting
-
-| Symptom | Check |
-|---|---|
-| SDK not detected | SDK Key/app, clean install, HTTPS, signature enabled |
-| session before install | use 2.0.6; install/referrer watchdog queues install first |
-| Apphud revenue not joined | webhook app/secret, transaction id, identity binding |
-| deferred path missing | Play referrer contains TrackHub match token; install was acknowledged |
-| no GAID | consent, AD_ID permission, ads-identifier runtime, LAT |
-| conversion blocked | consent/PIPL/country, mapping, click TTL, destination readiness |
-| privacy completion delayed | expected during outage; local tracking is already stopped |
-| repeated 401 | clock, SDK Key rotation and server grace period |
+SDK 3 is a clean break made before commercial integrations. Native SDK 2.x
+reports are intentionally rejected rather than maintained as a second contract.

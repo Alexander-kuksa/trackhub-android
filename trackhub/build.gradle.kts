@@ -32,7 +32,6 @@ android {
 }
 
 dependencies {
-    implementation("com.apphud:ApphudSDK-Android:3.4.2")
     // Official Google Play Install Referrer Library (attribution source)
     implementation("com.android.installreferrer:installreferrer:2.2")
     // Optional at runtime: do not force AD_ID permission or a minSdk increase
@@ -62,7 +61,7 @@ publishing {
             // Local publishing keeps stable TrackHub defaults.
             groupId = providers.gradleProperty("group").orElse("com.trackhub").get()
             artifactId = "trackhub-android"
-            version = providers.gradleProperty("version").orElse("2.0.6").get()
+            version = providers.gradleProperty("version").orElse("3.0.0").get()
             afterEvaluate { from(components["release"]) }
         }
     }

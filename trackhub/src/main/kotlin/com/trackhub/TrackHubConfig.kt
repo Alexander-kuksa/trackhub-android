@@ -40,7 +40,7 @@ data class TrackHubPiplConsent(
 )
 
 /**
- * The complete public TrackHub 2.0 startup configuration. `sdkKey` is copied
+ * The complete public TrackHub 3.0 startup configuration. `sdkKey` is copied
  * from TrackHub and contains the app-specific endpoint and ingest credentials.
  * It must never be logged or sent to another service.
  */
@@ -83,8 +83,8 @@ internal data class DecodedTrackHubSdkKey(
     companion object {
         private const val PREFIX = "thcfg_v1_"
 
-        fun decode(value: String): DecodedTrackHubSdkKey? = runCatching {
-            if (!value.startsWith(PREFIX) || value.length > 8192) return@runCatching null
+        fun decode(value: String): DecodedTrackHubSdkKey? = runCatchingException {
+            if (!value.startsWith(PREFIX) || value.length > 8192) return@runCatchingException null
             val encoded = value.removePrefix(PREFIX)
             val raw = String(Base64.getUrlDecoder().decode(encoded), Charsets.UTF_8)
             val json = JSONObject(raw)
@@ -92,19 +92,19 @@ internal data class DecodedTrackHubSdkKey(
             val ingestToken = json.getString("i")
             val sdkSecret = json.getString("s")
             if (!isAllowedEndpoint(endpoint) || ingestToken.length < 20 || sdkSecret.length < 20) {
-                return@runCatching null
+                return@runCatchingException null
             }
             DecodedTrackHubSdkKey(endpoint.trimEnd('/'), ingestToken, sdkSecret)
         }.getOrNull()
 
         internal fun isAllowedEndpoint(value: String): Boolean {
             if (value != value.trim()) return false
-            return runCatching {
+            return runCatchingException {
                 val uri = URI(value)
                 val scheme = uri.scheme?.lowercase(Locale.US)
                 val host = uri.host?.trim('[', ']')
-                if (uri.isOpaque || uri.userInfo != null || host.isNullOrBlank()) return@runCatching false
-                if (uri.rawQuery != null || uri.rawFragment != null) return@runCatching false
+                if (uri.isOpaque || uri.userInfo != null || host.isNullOrBlank()) return@runCatchingException false
+                if (uri.rawQuery != null || uri.rawFragment != null) return@runCatchingException false
                 scheme == "https" || (
                     scheme == "http" && (
                         host.equals("localhost", ignoreCase = true) ||

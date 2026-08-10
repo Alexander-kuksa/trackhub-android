@@ -10,9 +10,6 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.AtomicFile
-import com.apphud.sdk.Apphud
-import com.apphud.sdk.ApphudAttributionData
-import com.apphud.sdk.ApphudAttributionProvider
 import com.google.android.gms.ads.identifier.AdvertisingIdClient
 import com.google.android.gms.appset.AppSet
 import com.google.android.gms.tasks.Tasks
@@ -75,20 +72,19 @@ enum class TrackHubSalesEvent(val value: String) {
 
 /**
  * TrackHub Android SDK — installs, sessions, custom engagement events and the
- * privacy-preserving App Conversion purchase bridge. Revenue stays server-side
- * in Apphud; the SDK never accepts a price or currency.
+ * privacy-preserving App Conversion purchase bridge. Revenue stays server-side;
+ * the SDK never accepts a price or currency or imports a billing SDK.
  *
  *  - HTTPS is enforced (token would otherwise leak in transit).
  *  - The ingest token and SDK secret live in memory only — never written to
  *    disk and never logged (debug logging prints status, never credentials).
  *  - Install reports are HMAC-signed when an SDK secret is configured.
  *  - Failed measurement reports use a bounded at-least-once offline queue.
- *  - Purchase observations contain only transaction/product identity; Apphud
- *    supplies the authoritative value/currency before Google delivery.
+ *  - Purchase observations contain only transaction/product identity; the
+ *    configured server billing source supplies value/currency.
  *
- * Usage (on app launch, immediately after Apphud starts):
+ * Usage (on app launch):
  * ```
- * Apphud.start(applicationContext, "<apphud-api-key>")
  * TrackHub.start(applicationContext, TrackHubConfig(sdkKey = "<TrackHub SDK Key>"))
  * ```
  */
@@ -98,7 +94,7 @@ enum class TrackHubSalesEvent(val value: String) {
 object TrackHub {
 
     /** SDK version reported to the platform for integration detection. */
-    const val SDK_VERSION = "2.0.6"
+    const val SDK_VERSION = "3.0.0"
 
     private const val PREFS = "trackhub"
     private const val INSTALL_SENT_KEY = "install_sent"
@@ -107,7 +103,6 @@ object TrackHub {
     private const val SESSION_SEQ_KEY = "session_seq"
     private const val LAST_BACKGROUND_KEY = "last_background_ms"
     private const val INSTALL_UID_KEY = "install_uid"
-    private const val DEVICE_ID_KEY = "device_id"
     private const val ADVERTISING_ID_KEY = "advertising_id"
     private const val APP_SET_ID_KEY = "app_set_id"
     private const val LIMIT_AD_TRACKING_KEY = "limit_ad_tracking"
@@ -119,14 +114,14 @@ object TrackHub {
     private const val PENDING_OPENAI_OPPREF_KEY = "pending_openai_oppref"
     private const val COUNTRY_CODE_KEY = "country_code"
     private const val PUSH_TOKEN_KEY = "push_token_fcm"
-    private const val APPHUD_ATTRIBUTION_REVISION_PREFIX = "apphud_attribution_revision_"
+    private const val EXTERNAL_IDENTITIES_KEY = "external_identities_v3"
+    private const val EXTERNAL_IDENTITY_ACK_KEY = "external_identity_ack_v3"
     private const val DEFERRED_RESOLVE_PREFIX = "deferred_resolve_"
     private const val DEFERRED_MATCH_TOKEN_KEY = "deferred_match_token"
     private const val PRIVACY_DISABLED_KEY = "privacy_disabled_v2"
     private const val PENDING_ERASURE_KEY = "pending_erasure_v2"
     private const val LEGACY_PRIVACY_DISABLED_PREFIX = "privacy_disabled_"
     private const val LEGACY_PENDING_ERASURE_PREFIX = "pending_erasure_"
-    private const val APPHUD_USER_ID_PREFIX = "apphud_user_id_"
     private const val INSTALL_CREDENTIAL_BOOTSTRAP_PREFIX = "install_credential_bootstrap_"
     private const val RUNTIME_CIRCUIT_MARKER_KEY = "runtime_circuit_last_run_v1"
     private const val AD_USER_DATA_KEY = "consent_ad_user_data"
@@ -135,7 +130,7 @@ object TrackHub {
     private const val PIPL_CONSENT_KEY = "consent_pipl"
     private const val CROSS_BORDER_TRANSFER_CONSENT_KEY = "consent_cross_border_transfer"
     private const val ADS_MEASUREMENT_CONSENT_KEY = "consent_ads_measurement"
-    private const val SESSION_TIMEOUT_MS = 60_000L
+    private const val SESSION_TIMEOUT_MS = 30 * 60_000L
     private const val MAX_PENDING_REPORTS = 1000
     private const val MAX_PENDING_BYTES = 4 * 1024 * 1024
     private const val MAX_REPORT_BYTES = 64 * 1024
@@ -169,7 +164,6 @@ object TrackHub {
     @Volatile private var endpoint: String? = null
     @Volatile private var ingestToken: String? = null
     @Volatile private var sdkSecret: String? = null
-    @Volatile private var userId: String? = null
     @Volatile private var firebaseAppInstanceId: String? = null
     @Volatile private var integrationTestToken: String? = null
     @Volatile private var appContext: Context? = null
@@ -298,7 +292,6 @@ object TrackHub {
         }
         privacyStopRequested.set(false)
         trackingDisabled = false
-        this.userId = apphudUserId() ?: persistentDeviceId(configuredAppContext)
         this.firebaseAppInstanceId = configuration.firebaseAppInstanceId?.takeIf { it.isNotBlank() }
         val prefsEdit = prefs.edit()
         normalizedCountryCode(configuration.countryCode)?.let { prefsEdit.putString(COUNTRY_CODE_KEY, it) }
@@ -325,11 +318,8 @@ object TrackHub {
         firstOpenAt(configuredAppContext)
         reportRuntimeCircuitDiagnosticIfNeeded(configuredAppContext)
         runOnMain { registerLifecycle(configuredAppContext) }
-        if (configuration.googleAdsConsent.adUserData == TrackHubConsentStatus.GRANTED) {
-            runOnMain { runCatching { Apphud.collectDeviceIdentifiers() }.onFailure { log("Apphud identifier collection failed") } }
-        }
         val waitingForInstallQueue = reportInstallIfNeeded(configuredAppContext)
-        refreshApphudIdentity()
+        syncPersistedExternalIdentities(configuredAppContext)
         reportPushTokenIfAvailable(configuredAppContext)
         if (!waitingForInstallQueue) beginSessionIfNeeded(configuredAppContext)
         flushPending(configuredAppContext)
@@ -351,6 +341,40 @@ object TrackHub {
     fun updateFirebaseAppInstanceId(appInstanceId: String) {
         if (!privacyStopRequested.get() && !runtimeCircuitOpen.get() && appInstanceId.isNotEmpty()) {
             firebaseAppInstanceId = appInstanceId
+        }
+    }
+
+    /**
+     * Bind or clear an optional billing identity without importing that
+     * provider's SDK. Apphud, RevenueCat and custom providers are independent.
+     */
+    @JvmStatic
+    fun setExternalIdentity(provider: String, userId: String?) {
+        if (privacyStopRequested.get() || runtimeCircuitOpen.get()) return
+        val namespace = normalizedExternalProvider(provider) ?: return
+        val value = userId?.trim()
+        if (value != null && (value.isEmpty() || value.toByteArray(Charsets.UTF_8).size > 256)) return
+        io.execute {
+            val context = appContext ?: return@execute
+            val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val desired = runCatchingException {
+                JSONObject(prefs.getString(EXTERNAL_IDENTITIES_KEY, "{}") ?: "{}")
+            }.getOrDefault(JSONObject())
+            desired.put(namespace, value ?: "")
+            prefs.edit().putString(EXTERNAL_IDENTITIES_KEY, desired.toString()).apply()
+            syncExternalIdentity(context, namespace, value)
+        }
+    }
+
+    internal fun normalizedExternalProvider(raw: String): String? {
+        val provider = raw.trim().lowercase(Locale.US)
+        if (provider == "apphud" || provider == "revenuecat") return provider
+        if (!provider.startsWith("custom:")) return null
+        val slug = provider.removePrefix("custom:")
+        return provider.takeIf {
+            slug.length in 1..63 &&
+                (slug.first() in 'a'..'z' || slug.first() in '0'..'9') &&
+                slug.all { char -> char in 'a'..'z' || char in '0'..'9' || char == '_' || char == '-' }
         }
     }
 
@@ -385,9 +409,6 @@ object TrackHub {
             if (trackingDisabled || hasPersistedPrivacyDisable(configured)) return@execute
             val prefs = configured.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             applyGoogleAdsConsent(prefs.edit(), consent).apply()
-            if (consent.adUserData == TrackHubConsentStatus.GRANTED) {
-                runOnMain { runCatching { Apphud.collectDeviceIdentifiers() } }
-            }
             if (prefs.getBoolean(INSTALL_SENT_KEY, false)) sendConsentUpdate(configured)
         }
     }
@@ -454,11 +475,11 @@ object TrackHub {
     @JvmStatic
     fun attribution(completion: (TrackHubAttribution?) -> Unit) {
         if (runtimeCircuitOpen.get()) {
-            runOnMainSafely("attribution completion") { completion(null) }
+            runHostCallbackOnMain { completion(null) }
             return
         }
         currentAttribution?.let { current ->
-            runOnMainSafely("attribution completion") { completion(current) }
+            runHostCallbackOnMain { completion(current) }
             return
         }
         io.execute { fetchAttributionIfNeeded(completion) }
@@ -468,7 +489,7 @@ object TrackHub {
     @JvmStatic
     fun resolveDeferredDeepLink(completion: TrackHubDeferredDeepLinkHandler) {
         if (runtimeCircuitOpen.get()) {
-            runOnMainSafely("deferred deep-link completion") { completion(null) }
+            runHostCallbackOnMain { completion(null) }
             return
         }
         io.execute { resolveDeferredDeepLinkIfNeeded(completion) }
@@ -497,7 +518,7 @@ object TrackHub {
             && !hasPendingErasureState(configuredContext)
             && prefs.getString(INSTALL_UID_KEY, null) == null
         ) {
-            completion?.let { runOnMainSafely("privacy completion") { it(true) } }
+            completion?.let { runHostCallbackOnMain { it(true) } }
             return
         }
         val installUid = loadPendingErasure(configuredContext)?.optString("install_uid")
@@ -515,7 +536,7 @@ object TrackHub {
         if (loadPendingErasure(configuredContext) == null
             && !persistPendingErasure(configuredContext, job)
         ) {
-            completion?.let { runOnMainSafely("privacy completion") { it(false) } }
+            completion?.let { runHostCallbackOnMain { it(false) } }
             return
         }
         addPendingErasureCompletion(completion)
@@ -544,7 +565,7 @@ object TrackHub {
 
     /**
      * Record a non-financial engagement event. Revenue parameters deliberately
-     * do not exist; Apphud/S2S remains the financial source of truth.
+     * do not exist; server billing sources remain the financial truth.
      */
     @JvmStatic
     @JvmOverloads
@@ -554,9 +575,9 @@ object TrackHub {
         partnerParams: Map<String, *> = emptyMap<String, Any>(),
     ) {
         if (name.isBlank() || runtimeCircuitOpen.get()) return
-        val callbackSnapshot = runCatching { callbackParams.toMap() }.getOrNull()
+        val callbackSnapshot = runCatchingException { callbackParams.toMap() }.getOrNull()
             ?: return log("trackEvent callbackParams could not be copied — skipped")
-        val partnerSnapshot = runCatching { partnerParams.toMap() }.getOrNull()
+        val partnerSnapshot = runCatchingException { partnerParams.toMap() }.getOrNull()
             ?: return log("trackEvent partnerParams could not be copied — skipped")
         if (privacyStopRequested.get()) return
         // start() is queued on the same serial executor. An event called
@@ -564,10 +585,9 @@ object TrackHub {
         // instead of observing half-configured state or being dropped.
         io.execute {
             if (trackingDisabled || runtimeCircuitOpen.get()) return@execute
-            refreshApphudIdentity()
             val context = appContext ?: return@execute log("trackEvent before start — skipped")
-            val uid = userId ?: return@execute log("trackEvent before start — skipped")
-            val rawBody = runCatching {
+            val uid = installUid(context)
+            val rawBody = runCatchingException {
                 val body = deviceContextBody(context)
                     .put("client_event_id", UUID.randomUUID().toString())
                     .put("event_name", name)
@@ -604,15 +624,15 @@ object TrackHub {
             log("${event.value} requires a canonical placement — skipped")
             return
         }
-        val canonical = runCatching { callbackParams.toMutableMap() }.getOrNull()
+        val canonical = runCatchingException { callbackParams.toMutableMap() }.getOrNull()
             ?: return log("sales event parameters could not be copied — skipped")
         if (placement != null) canonical["placement_name"] = placement.value
         trackEvent(event.value, canonical, partnerParams)
     }
 
     /**
-     * Record the device-side observation for an Apphud purchase. This sends no
-     * money; the server joins by transaction id and uses Apphud value/currency.
+     * Record the device-side observation for a store purchase. This sends no
+     * money; the server joins by transaction id and supplies value/currency.
      * The endpoint requires sdkSecret and a real device IP.
      */
     @JvmStatic
@@ -623,13 +643,18 @@ object TrackHub {
             if (runtimeCircuitOpen.get()) return@execute
             if (sdkSecret.isNullOrEmpty()) return@execute log("trackPurchaseObserved requires sdkSecret — skipped")
             val context = appContext ?: return@execute log("trackPurchaseObserved before start — skipped")
-            val uid = userId ?: return@execute log("trackPurchaseObserved before start — skipped")
+            val uid = installUid(context)
             val body = deviceContextBody(context)
                 .put("transaction_id", transactionId)
                 .put("user_id", uid)
                 .put("install_uid", installUid(context))
             if (!productId.isNullOrEmpty()) body.put("product_id", productId)
-            sendOrQueue("sdk/purchase-context", body.toString())
+            sendOrQueue(
+                "sdk/purchase-context",
+                body.toString(),
+                kind = "transaction_context",
+                dedupeKey = "transaction_context:$transactionId",
+            )
         }
     }
 
@@ -657,7 +682,7 @@ object TrackHub {
         // are read from opaque URIs such as mailto:. Deep-link handling is a
         // public SDK boundary and must always fail open for the host app.
         if (!uri.isHierarchical) return false
-        val parameters = runCatching {
+        val parameters = runCatchingException {
             Triple(
                 uri.getQueryParameter("gclid")?.takeIf { it.isNotEmpty() },
                 uri.getQueryParameter("gbraid")?.takeIf { it.isNotEmpty() },
@@ -724,8 +749,8 @@ object TrackHub {
         return base.parentFile?.listFiles()?.any { it.name.startsWith(base.name) } == true
     }
 
-    /** Recover token-scoped SDK 2.0 jobs even after the app starts with a newly
-     * rotated sdkKey. The app sandbox itself is the privacy namespace. */
+    /** Recover pre-3.0 token-scoped privacy jobs even after the app starts with
+     * a newly rotated sdkKey. The app sandbox itself is the privacy namespace. */
     private fun migrateLegacyPrivacyState(context: Context) = synchronized(privacyStateLock) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         if (prefs.all.any { (key, value) ->
@@ -743,14 +768,14 @@ object TrackHub {
                 && it.name != "trackhub-pending-erasure-v2.json"
         }.orEmpty()
         for (file in fileCandidates) {
-            val job = runCatching {
+            val job = runCatchingException {
                 val raw = file.readText(Charsets.UTF_8)
                 if (raw.toByteArray(Charsets.UTF_8).size > 1024) null else JSONObject(raw)
             }.getOrNull()?.takeIf {
                 isUuid(it.optString("install_uid")) && it.optString("reason").length <= 256
             } ?: continue
             if (persistPendingErasure(context, job)) {
-                runCatching { file.delete() }
+                runCatchingException { file.delete() }
                 prefs.edit().putBoolean(PRIVACY_DISABLED_KEY, true).commit()
                 return
             }
@@ -759,7 +784,7 @@ object TrackHub {
             if (!key.startsWith(LEGACY_PENDING_ERASURE_PREFIX) || key == PENDING_ERASURE_KEY) continue
             val raw = value as? String ?: continue
             if (raw.toByteArray(Charsets.UTF_8).size > 1024) continue
-            val job = runCatching { JSONObject(raw) }.getOrNull()?.takeIf {
+            val job = runCatchingException { JSONObject(raw) }.getOrNull()?.takeIf {
                 isUuid(it.optString("install_uid")) && it.optString("reason").length <= 256
             } ?: continue
             if (persistPendingErasure(context, job)) {
@@ -783,8 +808,8 @@ object TrackHub {
                 .remove(PENDING_ERASURE_KEY)
                 .commit()
             true
-        } catch (_: Throwable) {
-            output?.let { runCatching { atomic.failWrite(it) } }
+        } catch (_: Exception) {
+            output?.let { runCatchingException { atomic.failWrite(it) } }
             // Keep a synchronous second copy if AtomicFile cannot be opened.
             // A killed process must still resume the privacy request.
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
@@ -795,10 +820,10 @@ object TrackHub {
 
     private fun loadPendingErasure(context: Context): JSONObject? = synchronized(privacyStateLock) {
         val atomic = AtomicFile(pendingErasureFile(context))
-        val fromFile = runCatching {
+        val fromFile = runCatchingException {
             atomic.openRead().bufferedReader(Charsets.UTF_8).use { reader ->
                 val raw = reader.readText()
-                if (raw.toByteArray(Charsets.UTF_8).size > 1024) return@runCatching null
+                if (raw.toByteArray(Charsets.UTF_8).size > 1024) return@runCatchingException null
                 JSONObject(raw).takeIf {
                     isUuid(it.optString("install_uid")) && it.optString("reason").length <= 256
                 }
@@ -809,13 +834,13 @@ object TrackHub {
             .getString(PENDING_ERASURE_KEY, null)
             ?: return@synchronized null
         if (raw.toByteArray(Charsets.UTF_8).size > 1024) return@synchronized null
-        runCatching { JSONObject(raw) }.getOrNull()?.takeIf {
+        runCatchingException { JSONObject(raw) }.getOrNull()?.takeIf {
             isUuid(it.optString("install_uid")) && it.optString("reason").length <= 256
         }
     }
 
     private fun deletePendingErasure(context: Context) = synchronized(privacyStateLock) {
-        runCatching { AtomicFile(pendingErasureFile(context)).delete() }
+        runCatchingException { AtomicFile(pendingErasureFile(context)).delete() }
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .remove(PENDING_ERASURE_KEY)
             .commit()
@@ -828,7 +853,7 @@ object TrackHub {
         // is selected on the next launch.
         context.noBackupFilesDir.listFiles()?.filter {
             it.name.startsWith("trackhub-$PENDING_REPORTS_KEY")
-        }?.forEach { runCatching { it.delete() } }
+        }?.forEach { runCatchingException { it.delete() } }
         val edit = prefs.edit()
             .remove(PENDING_REPORTS_KEY)
             .remove(PUSH_TOKEN_KEY)
@@ -842,7 +867,6 @@ object TrackHub {
             .remove(OPENAI_OPPREF_KEY)
             .remove(PENDING_OPENAI_OPPREF_KEY)
             .remove(DEFERRED_MATCH_TOKEN_KEY)
-            .remove(DEVICE_ID_KEY)
             .remove(FIRST_OPEN_AT_KEY)
             .remove(SESSION_SEQ_KEY)
             .remove(LAST_BACKGROUND_KEY)
@@ -853,10 +877,10 @@ object TrackHub {
             .remove(PIPL_CONSENT_KEY)
             .remove(CROSS_BORDER_TRANSFER_CONSENT_KEY)
             .remove(ADS_MEASUREMENT_CONSENT_KEY)
+            .remove(EXTERNAL_IDENTITIES_KEY)
+            .remove(EXTERNAL_IDENTITY_ACK_KEY)
         prefs.all.keys.filter {
-            it.startsWith(APPHUD_ATTRIBUTION_REVISION_PREFIX) ||
-                it.startsWith(APPHUD_USER_ID_PREFIX) ||
-                it.startsWith(DEFERRED_RESOLVE_PREFIX) ||
+            it.startsWith(DEFERRED_RESOLVE_PREFIX) ||
                 it.startsWith(INSTALL_CREDENTIAL_BOOTSTRAP_PREFIX)
         }.forEach(edit::remove)
         if (!keepInstallCredential) {
@@ -866,7 +890,6 @@ object TrackHub {
         pendingGclid = null
         pendingGbraid = null
         pendingOpenAiOppref = null
-        userId = null
         firebaseAppInstanceId = null
     }
 
@@ -917,7 +940,7 @@ object TrackHub {
                     deletePendingErasure(context)
                     clearLocalMeasurementState(context, keepInstallCredential = false)
                     takePendingErasureCompletion()?.let { callback ->
-                        runOnMainSafely("privacy completion") { callback(true) }
+                        runHostCallbackOnMain { callback(true) }
                     }
                     log("device privacy erasure confirmed")
                     return@execute
@@ -965,7 +988,6 @@ object TrackHub {
                     if (trackingDisabled) {
                         retryPendingErasure()
                     } else {
-                        refreshApphudIdentity()
                         if (!reportInstallIfNeeded(context)) beginSessionIfNeeded(context)
                     }
                 }
@@ -989,7 +1011,7 @@ object TrackHub {
 
     private fun beginSessionIfNeeded(context: Context, force: Boolean = false) {
         if (runtimeCircuitOpen.get()) return
-        val uid = userId ?: return
+        val uid = installUid(context)
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val now = System.currentTimeMillis()
         val lastBackground = prefs.getLong(LAST_BACKGROUND_KEY, 0L)
@@ -1065,18 +1087,18 @@ object TrackHub {
                     )
                 }
             }
-            runCatching { client.endConnection() }
+            runCatchingException { client.endConnection() }
         }
         // Some vendor implementations neither connect nor disconnect. A
         // bounded fallback keeps the install/session queue moving as organic.
         scheduleWatchdog("install referrer fallback", 3, TimeUnit.SECONDS) { finishInitial(null) }
         scheduleWatchdog("install referrer cleanup", 30, TimeUnit.SECONDS) {
-            runCatching { client.endConnection() }
+            runCatchingException { client.endConnection() }
         }
-        runCatching {
+        runCatchingException {
             client.startConnection(object : InstallReferrerStateListener {
                 override fun onInstallReferrerSetupFinished(responseCode: Int) {
-                    val referrer = runCatching {
+                    val referrer = runCatchingException {
                         if (responseCode == InstallReferrerClient.InstallReferrerResponse.OK) {
                             client.installReferrer.installReferrer
                         } else null
@@ -1104,7 +1126,7 @@ object TrackHub {
         beginSession: Boolean = true,
     ) {
         if (runtimeCircuitOpen.get()) return
-        val uid = userId ?: return
+        val uid = installUid(context)
         deferredMatchToken(referrer)?.let { matchToken ->
             prefs.edit().putString(DEFERRED_MATCH_TOKEN_KEY, matchToken).apply()
         }
@@ -1155,11 +1177,11 @@ object TrackHub {
     internal fun deferredMatchToken(referrer: String?): String? {
         if (referrer.isNullOrBlank()) return null
         return referrer.split('&').asSequence().mapNotNull { pair ->
-            runCatching {
+            runCatchingException {
                 val separator = pair.indexOf('=')
                 val rawKey = if (separator >= 0) pair.substring(0, separator) else pair
                 if (URLDecoder.decode(rawKey, Charsets.UTF_8.name()) != "trackhub_match_token") {
-                    return@runCatching null
+                    return@runCatchingException null
                 }
                 val rawValue = if (separator >= 0) pair.substring(separator + 1) else ""
                 URLDecoder.decode(rawValue, Charsets.UTF_8.name()).takeIf { it.length in 1..128 }
@@ -1188,7 +1210,7 @@ object TrackHub {
         if (!collectAdvertisingId || !prefs.getBoolean(AD_USER_DATA_KEY, false)) return
         val info = try {
             AdvertisingIdClient.getAdvertisingIdInfo(context)
-        } catch (_: Throwable) {
+        } catch (_: Exception) {
             null
         }
         val id = info?.id?.takeIf {
@@ -1223,7 +1245,7 @@ object TrackHub {
         prefs.getString(APP_SET_ID_KEY, null)?.takeIf(::isUuid)?.let { return it }
         val fetched = try {
             Tasks.await(AppSet.getClient(context).appSetIdInfo, 2, TimeUnit.SECONDS).id
-        } catch (_: Throwable) {
+        } catch (_: Exception) {
             null
         }
         val value = fetched?.takeIf(::isUuid) ?: return null
@@ -1232,10 +1254,10 @@ object TrackHub {
     }
 
     private fun isUuid(value: String): Boolean =
-        runCatching { UUID.fromString(value) }.isSuccess
+        runCatchingException { UUID.fromString(value) }.isSuccess
 
     private fun sendConsentUpdate(context: Context) {
-        val uid = userId ?: return
+        val uid = installUid(context)
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val body = JSONObject()
             .put("user_id", uid)
@@ -1250,7 +1272,7 @@ object TrackHub {
 
     private fun reportPushTokenIfAvailable(context: Context) {
         if (trackingDisabled || integrationTestToken != null || sdkSecret.isNullOrBlank()) return
-        val uid = userId ?: return
+        val uid = installUid(context)
         val token = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getString(PUSH_TOKEN_KEY, null)
             ?.takeIf { it.length in 32..4096 }
@@ -1271,15 +1293,14 @@ object TrackHub {
     private fun fetchAttributionIfNeeded(completion: ((TrackHubAttribution?) -> Unit)? = null) {
         if (trackingDisabled || runtimeCircuitOpen.get() || attributionFetchInFlight || integrationTestToken != null) {
             completion?.let { callback ->
-                runOnMainSafely("attribution completion") { callback(null) }
+                runHostCallbackOnMain { callback(null) }
             }
             return
         }
         val context = appContext
-        val uid = userId
-        if (context == null || uid.isNullOrBlank()) {
+        if (context == null) {
             completion?.let { callback ->
-                runOnMainSafely("attribution completion") { callback(null) }
+                runHostCallbackOnMain { callback(null) }
             }
             return
         }
@@ -1287,7 +1308,7 @@ object TrackHub {
         val directToken = ingestToken?.let { loadInstallCredential(context, it, installUid) }
         if (directToken == null) {
             completion?.let { callback ->
-                runOnMainSafely("attribution completion") { callback(null) }
+                runHostCallbackOnMain { callback(null) }
             }
             reportInstallIfNeeded(context)
             log("attribution waiting for install credential")
@@ -1304,18 +1325,11 @@ object TrackHub {
                     val changed = currentAttribution?.revision != snapshot.revision
                     currentAttribution = snapshot
                     if (changed) attributionChangedHandler?.let { handler ->
-                        runOnMain {
-                            runCatching { handler(snapshot) }
-                                .onFailure { log("attribution-changed handler failed") }
-                        }
+                        runHostCallbackOnMain { handler(snapshot) }
                     }
-                    deliverAttributionToApphud(uid, snapshot)
                 }
                 completion?.let { callback ->
-                    runOnMain {
-                        runCatching { callback(snapshot) }
-                            .onFailure { log("attribution completion failed") }
-                    }
+                    runHostCallbackOnMain { callback(snapshot) }
                 }
             }
         }
@@ -1346,11 +1360,11 @@ object TrackHub {
         }
     }
 
-    private fun parseAttribution(raw: String): TrackHubAttribution? = runCatching {
+    private fun parseAttribution(raw: String): TrackHubAttribution? = runCatchingException {
         val envelope = JSONObject(raw)
-        if (!envelope.optBoolean("ok")) return@runCatching null
-        val attribution = envelope.optJSONObject("attribution") ?: return@runCatching null
-        if (attribution.optString("provider") != "custom") return@runCatching null
+        if (!envelope.optBoolean("ok")) return@runCatchingException null
+        val attribution = envelope.optJSONObject("attribution") ?: return@runCatchingException null
+        if (attribution.optString("provider") != "custom") return@runCatchingException null
         val dataJson = attribution.getJSONObject("data")
         val data = buildMap<String, String> {
             val keys = dataJson.keys()
@@ -1373,56 +1387,44 @@ object TrackHub {
         )
     }.getOrNull()
 
-    private fun deliverAttributionToApphud(userId: String, snapshot: TrackHubAttribution) {
-        val context = appContext ?: return
+    private fun externalIdentityFingerprint(provider: String, userId: String?): String =
+        hashKey("$provider\u0000${userId ?: "<logout>"}")
+
+    private fun syncPersistedExternalIdentities(context: Context) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val key = APPHUD_ATTRIBUTION_REVISION_PREFIX + hashKey(userId)
-        if (prefs.getString(key, null) == snapshot.revision) return
-        runOnMain {
-            runCatching {
-                Apphud.setAttribution(
-                    ApphudAttributionData(rawData = snapshot.data),
-                    ApphudAttributionProvider.CUSTOM,
-                )
-                prefs.edit().putString(key, snapshot.revision).apply()
-            }.onFailure { log("Apphud attribution handler failed") }
+        val desired = runCatchingException {
+            JSONObject(prefs.getString(EXTERNAL_IDENTITIES_KEY, "{}") ?: "{}")
+        }.getOrDefault(JSONObject())
+        val providers = desired.keys()
+        while (providers.hasNext()) {
+            val provider = providers.next()
+            val stored = desired.optString(provider)
+            syncExternalIdentity(context, provider, stored.takeIf { it.isNotEmpty() })
         }
     }
 
-    private fun apphudUserId(): String? = runCatching { Apphud.userId() }
-        .getOrNull()
-        ?.toString()
-        ?.trim()
-        ?.takeIf { it.isNotEmpty() }
-
-    /** Runs on `io`; Apphud identity is observed automatically, never supplied by the host. */
-    private fun refreshApphudIdentity() {
+    private fun syncExternalIdentity(context: Context, provider: String, userId: String?) {
         if (trackingDisabled || runtimeCircuitOpen.get() || privacyStopRequested.get()) return
-        val context = appContext ?: return
-        val apphudId = apphudUserId() ?: return
-        val previousRuntimeId = userId
-        userId = apphudId
-        val token = ingestToken ?: return
+        if (normalizedExternalProvider(provider) != provider) return
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val key = APPHUD_USER_ID_PREFIX + hashKey(token)
-        if (prefs.getString(key, null) == apphudId) return
+        val fingerprint = externalIdentityFingerprint(provider, userId)
+        val acknowledged = runCatchingException {
+            JSONObject(prefs.getString(EXTERNAL_IDENTITY_ACK_KEY, "{}") ?: "{}")
+        }.getOrDefault(JSONObject())
+        if (acknowledged.optString(provider) == fingerprint) return
         val body = JSONObject()
-            .put("user_id", apphudId)
+            .put("provider", provider)
+            .put("external_user_id", userId ?: JSONObject.NULL)
             .put("install_uid", installUid(context))
             .put("sdk_source", "trackhub-android")
             .put("sdk_version", SDK_VERSION)
             .toString()
-        val identityHash = hashKey(apphudId)
         sendOrQueue(
             "sdk/identity",
             body,
-            kind = "apphud_identity:$identityHash",
-            dedupeKey = "apphud_identity:$identityHash",
+            kind = "external_identity",
+            dedupeKey = "external_identity:$provider",
         )
-        if (previousRuntimeId != apphudId) {
-            reportPushTokenIfAvailable(context)
-            fetchAttributionIfNeeded()
-        }
     }
 
     private fun resolveDeferredDeepLinkIfNeeded(
@@ -1430,7 +1432,7 @@ object TrackHub {
     ) {
         if (trackingDisabled || runtimeCircuitOpen.get() || deferredResolveInFlight || integrationTestToken != null) {
             completion?.let { callback ->
-                runOnMainSafely("deferred deep-link completion") { callback(null) }
+                runHostCallbackOnMain { callback(null) }
             }
             return
         }
@@ -1447,12 +1449,12 @@ object TrackHub {
         }
         val key = DEFERRED_RESOLVE_PREFIX + hashKey(token)
         if (prefs.getBoolean(key, false)) {
-            if (completion != null) runOnMainSafely("deferred deep-link handler") { handler(null) }
+            if (completion != null) runHostCallbackOnMain { handler(null) }
             return
         }
         val matchToken = prefs.getString(DEFERRED_MATCH_TOKEN_KEY, null)
         if (matchToken.isNullOrBlank()) {
-            if (completion != null) runOnMainSafely("deferred deep-link handler") { handler(null) }
+            if (completion != null) runHostCallbackOnMain { handler(null) }
             return
         }
         deferredResolveInFlight = true
@@ -1460,7 +1462,7 @@ object TrackHub {
         val networkConfig = currentNetworkConfig()
         if (networkConfig == null) {
             deferredResolveInFlight = false
-            runOnMain { runCatching { handler(null) } }
+            runHostCallbackOnMain { handler(null) }
             return
         }
         auxiliaryNetwork.execute {
@@ -1468,20 +1470,14 @@ object TrackHub {
             io.execute state@{
                 deferredResolveInFlight = false
                 if (code !in 200..299 || raw == null) {
-                    runOnMain {
-                        runCatching { handler(null) }
-                            .onFailure { log("deferred deep-link handler failed") }
-                    }
+                    runHostCallbackOnMain { handler(null) }
                     return@state
                 }
-                val path = runCatching {
+                val path = runCatchingException {
                     JSONObject(raw).optString("deep_link_path").takeIf { it.isNotEmpty() }
                 }.getOrNull()
                 prefs.edit().putBoolean(key, true).remove(DEFERRED_MATCH_TOKEN_KEY).apply()
-                runOnMain {
-                    runCatching { handler(path) }
-                        .onFailure { log("deferred deep-link handler failed") }
-                }
+                runHostCallbackOnMain { handler(path) }
             }
         }
     }
@@ -1620,7 +1616,8 @@ object TrackHub {
 
     private fun pendingEvictionIndex(items: JSONArray): Int {
         for (i in 0 until items.length()) {
-            if (items.optJSONObject(i)?.optString("kind") != "production_install") return i
+            val kind = items.optJSONObject(i)?.optString("kind")
+            if (kind != "production_install" && kind != "transaction_context") return i
         }
         return 0
     }
@@ -1642,7 +1639,7 @@ object TrackHub {
             val legacyFile = pendingQueueFile(context, legacyQueueKey)
             val legacyBackup = File(legacyFile.path + ".bak")
             if (legacyFile.exists() || legacyBackup.exists()) {
-                val migrated = runCatching {
+                val migrated = runCatchingException {
                     AtomicFile(legacyFile).openRead().bufferedReader(Charsets.UTF_8).use { reader ->
                         decodePending(reader.readText())
                     }
@@ -1678,7 +1675,7 @@ object TrackHub {
         if (!file.exists() && !backup.exists()) return JSONArray()
 
         val atomic = AtomicFile(file)
-        val raw = runCatching {
+        val raw = runCatchingException {
             atomic.openRead().use { input ->
                 val output = ByteArrayOutputStream()
                 val buffer = ByteArray(8192)
@@ -1720,7 +1717,7 @@ object TrackHub {
             .orEmpty()
         if (candidateBases.isEmpty()) return
 
-        fun readQueue(file: File): JSONArray? = runCatching {
+        fun readQueue(file: File): JSONArray? = runCatchingException {
             AtomicFile(file).openRead().bufferedReader(Charsets.UTF_8).use { reader ->
                 decodePending(reader.readText())
             }
@@ -1753,7 +1750,7 @@ object TrackHub {
 
     private fun decodePending(raw: String): JSONArray? {
         if (raw.toByteArray(Charsets.UTF_8).size > MAX_PENDING_BYTES * 2) return null
-        return runCatching { JSONArray(raw) }.getOrNull()
+        return runCatchingException { JSONArray(raw) }.getOrNull()
     }
 
     @Synchronized
@@ -1768,8 +1765,8 @@ object TrackHub {
             output.flush()
             atomic.finishWrite(output)
             true
-        } catch (_: Throwable) {
-            output?.let { runCatching { atomic.failWrite(it) } }
+        } catch (_: Exception) {
+            output?.let { runCatchingException { atomic.failWrite(it) } }
             false
         }
     }
@@ -1777,13 +1774,13 @@ object TrackHub {
     private fun quarantinePendingQueue(file: File) {
         val suffix = ".corrupt-${System.currentTimeMillis()}"
         val backup = File(file.path + ".bak")
-        if (file.exists()) runCatching { file.renameTo(File(file.path + suffix)) }
-        if (backup.exists()) runCatching { backup.renameTo(File(backup.path + suffix)) }
+        if (file.exists()) runCatchingException { file.renameTo(File(file.path + suffix)) }
+        if (backup.exists()) runCatchingException { backup.renameTo(File(backup.path + suffix)) }
     }
 
     @Synchronized
     private fun deletePendingQueue(context: Context, queueKey: String) {
-        runCatching { AtomicFile(pendingQueueFile(context, queueKey)).delete() }
+        runCatchingException { AtomicFile(pendingQueueFile(context, queueKey)).delete() }
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit().remove(queueKey).commit()
     }
@@ -1866,7 +1863,7 @@ object TrackHub {
             deletePendingErasure(context)
             clearLocalMeasurementState(context, keepInstallCredential = false)
             takePendingErasureCompletion()?.let { callback ->
-                runOnMainSafely("privacy completion") { callback(true) }
+                runHostCallbackOnMain { callback(true) }
             }
             log("server confirmed device privacy erasure — tracking stopped")
             return
@@ -1925,16 +1922,27 @@ object TrackHub {
                     resolveDeferredDeepLinkIfNeeded()
                 }
                 "test_install" -> log("integration-test install reported")
-                else -> if (pending.kind?.startsWith("apphud_identity:") == true) {
-                    val apphudId = runCatching { JSONObject(pending.body).optString("user_id") }
-                        .getOrNull()
-                        ?.takeIf { it.isNotEmpty() }
-                    val token = ingestToken
-                    if (apphudId != null && token != null) {
+                "external_identity" -> {
+                    runCatchingException {
+                        val body = JSONObject(pending.body)
+                        val provider = body.getString("provider")
+                        val externalId = if (body.isNull("external_user_id")) {
+                            null
+                        } else {
+                            body.getString("external_user_id")
+                        }
+                        val acknowledged = JSONObject(
+                            prefs.getString(EXTERNAL_IDENTITY_ACK_KEY, "{}") ?: "{}",
+                        )
+                        acknowledged.put(
+                            provider,
+                            externalIdentityFingerprint(provider, externalId),
+                        )
                         prefs.edit()
-                            .putString(APPHUD_USER_ID_PREFIX + hashKey(token), apphudId)
+                            .putString(EXTERNAL_IDENTITY_ACK_KEY, acknowledged.toString())
                             .apply()
-                    }
+                    }.onFailure { log("external identity ACK could not be persisted") }
+                    reportPushTokenIfAvailable(context)
                 }
             }
         } else {
@@ -2009,7 +2017,7 @@ object TrackHub {
 
     private fun withIntegrationTestToken(rawBody: String): String {
         val token = integrationTestToken ?: return rawBody
-        return runCatching { JSONObject(rawBody).put("test_run_token", token).toString() }
+        return runCatchingException { JSONObject(rawBody).put("test_run_token", token).toString() }
             .getOrDefault(rawBody)
     }
 
@@ -2056,10 +2064,10 @@ object TrackHub {
             connection.outputStream.use { it.write(rawBody.toByteArray(Charsets.UTF_8)) }
             val code = connection.responseCode
             code to readLimitedResponse(connection, code)
-        } catch (_: Throwable) {
+        } catch (_: Exception) {
             -1 to null
         } finally {
-            runCatching { conn?.disconnect() }
+            runCatchingException { conn?.disconnect() }
         }
     }
 
@@ -2076,10 +2084,10 @@ object TrackHub {
             val code = connection.responseCode
             val response = readLimitedResponse(connection, code)
             code to response
-        } catch (_: Throwable) {
+        } catch (_: Exception) {
             -1 to null
         } finally {
-            runCatching { conn?.disconnect() }
+            runCatchingException { conn?.disconnect() }
         }
     }
 
@@ -2109,15 +2117,15 @@ object TrackHub {
         error: String,
         serverTime: Long,
         localTimeMs: Long,
-    ): Long? = runCatching {
+    ): Long? = runCatchingException {
         if (error != "clock_skew" || serverTime !in 1_577_836_800_000L..4_102_444_800_000L) {
-            return@runCatching null
+            return@runCatchingException null
         }
         Math.subtractExact(serverTime, localTimeMs)
     }.getOrNull()
 
-    private fun serverClockOffset(raw: String?, localTimeMs: Long): Long? = runCatching {
-        val json = JSONObject(raw ?: return@runCatching null)
+    private fun serverClockOffset(raw: String?, localTimeMs: Long): Long? = runCatchingException {
+        val json = JSONObject(raw ?: return@runCatchingException null)
         val serverTime = json.optLong("server_time_ms", 0L)
         val error = json.optString("error")
         serverClockOffset(error, serverTime, localTimeMs)
@@ -2129,7 +2137,7 @@ object TrackHub {
         return true
     }
 
-    private fun appVersion(context: Context): String? = runCatching {
+    private fun appVersion(context: Context): String? = runCatchingException {
         @Suppress("DEPRECATION")
         context.packageManager.getPackageInfo(context.packageName, 0).versionName
     }.getOrNull()
@@ -2141,14 +2149,6 @@ object TrackHub {
         val now = System.currentTimeMillis()
         prefs.edit().putLong(FIRST_OPEN_AT_KEY, now).apply()
         Date(now)
-    }
-
-    private fun persistentDeviceId(context: Context): String = synchronized(identityStateLock) {
-        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        prefs.getString(DEVICE_ID_KEY, null)?.takeIf { it.isNotBlank() }?.let { return@synchronized it }
-        val value = UUID.randomUUID().toString()
-        prefs.edit().putString(DEVICE_ID_KEY, value).apply()
-        value
     }
 
     private fun installUid(context: Context): String = synchronized(identityStateLock) {
@@ -2180,7 +2180,7 @@ object TrackHub {
     @Synchronized
     private fun loadInstallCredential(context: Context, token: String, installUid: String): String? {
         val atomic = AtomicFile(installCredentialFile(context, token, installUid))
-        return runCatching {
+        return runCatchingException {
             atomic.openRead().use { input ->
                 val bytes = ByteArray(129)
                 var count = 0
@@ -2189,7 +2189,7 @@ object TrackHub {
                     if (read < 0) break
                     count += read
                 }
-                if (count > 128) return@runCatching null
+                if (count > 128) return@runCatchingException null
                 String(bytes, 0, count, Charsets.UTF_8).takeIf(::isValidInstallCredential)
             }
         }.getOrNull()
@@ -2211,20 +2211,20 @@ object TrackHub {
             output.flush()
             atomic.finishWrite(output)
             true
-        } catch (_: Throwable) {
-            output?.let { runCatching { atomic.failWrite(it) } }
+        } catch (_: Exception) {
+            output?.let { runCatchingException { atomic.failWrite(it) } }
             false
         }
     }
 
     private fun deleteInstallCredential(context: Context, token: String, installUid: String) {
-        runCatching { AtomicFile(installCredentialFile(context, token, installUid)).delete() }
+        runCatchingException { AtomicFile(installCredentialFile(context, token, installUid)).delete() }
     }
 
     private fun deleteAllInstallCredentials(context: Context) {
         context.noBackupFilesDir.listFiles()?.filter {
             it.name.startsWith("trackhub_install_credential_")
-        }?.forEach { runCatching { it.delete() } }
+        }?.forEach { runCatchingException { it.delete() } }
     }
 
     private fun installCredentialBootstrapKey(token: String): String =
@@ -2232,7 +2232,7 @@ object TrackHub {
 
     private fun saveInstallCredential(context: Context, responseBody: String?) {
         val token = ingestToken ?: return
-        val json = runCatching { JSONObject(responseBody ?: return) }.getOrNull() ?: return
+        val json = runCatchingException { JSONObject(responseBody ?: return) }.getOrNull() ?: return
         val credential = json.optString("install_token")
         val responseInstallUid = json.optString("install_uid")
         if (responseInstallUid != installUid(context)) return
@@ -2403,9 +2403,24 @@ object TrackHub {
         }
     }
 
-    private fun runOnMainSafely(label: String, block: () -> Unit) {
-        runOnMain {
-            runCatching(block).onFailure { log("$label failed") }
+    // Host callbacks are intentionally outside the SDK circuit. If host code
+    // throws, its own crash reporting must see it; treating that as a TrackHub
+    // algorithm failure would hide an application bug and disable measurement.
+    private fun runHostCallbackOnMain(block: () -> Unit) {
+        val looper = try {
+            Looper.getMainLooper()
+        } catch (failure: Exception) {
+            handleAlgorithmFailure("host callback dispatch", failure)
+            return
+        }
+        if (looper == null || Looper.myLooper() == looper) {
+            block()
+        } else {
+            try {
+                Handler(looper).post(Runnable { block() })
+            } catch (failure: Exception) {
+                handleAlgorithmFailure("host callback dispatch", failure)
+            }
         }
     }
 
