@@ -37,11 +37,15 @@ Upgrades from 3.0.1 with an existing credential queue one idempotent `/install`
 context refresh when the cache is missing. A `2xx` without
 `geo_ack_version: 1` is an old server and retries with backoff. The durable job
 retires after 12 retryable/old-contract responses and fails silently. A v1 ACK
-without country/EEA is a valid terminal unknown result.
+without country/EEA is a valid terminal unknown result. The server must encode
+the ACK version as the integer JSON token `1`, not `1.0` or a string, and must
+omit unknown country/EEA fields instead of emitting explicit `null`.
 
 Release gate: tag/publish 3.0.2 only after the platform contract, tests and
-production deployment are verified. The versioned ACK is rollout-safe; a
-server-first release avoids unnecessary bounded retries.
+production deployment are verified with a live `/install` ACK. Server-first is
+mandatory: after 12 old-contract responses the install-scoped terminal marker
+does not re-arm when the server is deployed later. Bounded retry preserves
+measurement safety but cannot recover that installation's device geo cache.
 
 Public measurement, deep-link, consent, attribution, push-token, purchase
 context and erasure methods remain asynchronous. Sessions coalesce for 30
