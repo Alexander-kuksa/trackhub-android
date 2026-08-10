@@ -18,6 +18,31 @@ The desired identity is persisted immediately, but production delivery waits
 for the install acknowledgement. Test Lab remains independent. Version 3.0.1
 also lets a queued production install pass a blocked 3.0.0 identity head.
 
+## First-party measurement geography (3.0.2)
+
+A compatible production `/install` ACK includes `geo_ack_version: 1` and may
+include ISO-3166 `country` and protective `eea` values resolved at Daively's
+trusted edge. TrackHub validates them, scopes them to the current `install_uid`,
+and durably caches them for later install, session, event, consent and
+purchase-context payloads. This is a device fallback only; trusted-edge
+geography is resolved again server-side for consent and external-delivery
+policy.
+
+Host `countryCode` is an optional initial fallback and may be replaced by a
+later server result. EEA merges protectively: host true OR cached true remains
+true. The SDK never uses Locale or GPS as geography and never discovers, stores
+or sends an IP address.
+
+Upgrades from 3.0.1 with an existing credential queue one idempotent `/install`
+context refresh when the cache is missing. A `2xx` without
+`geo_ack_version: 1` is an old server and retries with backoff. The durable job
+retires after 12 retryable/old-contract responses and fails silently. A v1 ACK
+without country/EEA is a valid terminal unknown result.
+
+Release gate: tag/publish 3.0.2 only after the platform contract, tests and
+production deployment are verified. The versioned ACK is rollout-safe; a
+server-first release avoids unnecessary bounded retries.
+
 Public measurement, deep-link, consent, attribution, push-token, purchase
 context and erasure methods remain asynchronous. Sessions coalesce for 30
 minutes in background; a captured deep link can force a new session.

@@ -94,7 +94,7 @@ enum class TrackHubSalesEvent(val value: String) {
 object TrackHub {
 
     /** SDK version reported to the platform for integration detection. */
-    const val SDK_VERSION = "3.0.1"
+    const val SDK_VERSION = "3.0.2"
 
     private const val PREFS = "trackhub"
     private const val INSTALL_SENT_KEY = "install_sent"
@@ -113,6 +113,12 @@ object TrackHub {
     private const val OPENAI_OPPREF_KEY = "openai_oppref"
     private const val PENDING_OPENAI_OPPREF_KEY = "pending_openai_oppref"
     private const val COUNTRY_CODE_KEY = "country_code"
+    private const val MEASUREMENT_COUNTRY_KEY = "measurement_geo_country_v1"
+    private const val MEASUREMENT_EEA_KEY = "measurement_geo_eea_v1"
+    private const val MEASUREMENT_GEO_INSTALL_UID_KEY = "measurement_geo_install_uid_v1"
+    private const val MEASUREMENT_GEO_REFRESH_TERMINAL_KEY = "measurement_geo_refresh_terminal_v1"
+    private const val MEASUREMENT_GEO_REFRESH_KIND = "install_geo_refresh"
+    private const val MEASUREMENT_GEO_REFRESH_DEDUPE_KEY = "install_geo_refresh_v1"
     private const val PUSH_TOKEN_KEY = "push_token_fcm"
     private const val EXTERNAL_IDENTITIES_KEY = "external_identities_v3"
     private const val EXTERNAL_IDENTITY_ACK_KEY = "external_identity_ack_v3"
@@ -140,6 +146,7 @@ object TrackHub {
     private const val RETRY_BASE_MS = 1_000L
     private const val RETRY_MAX_MS = 5 * 60_000L
     private const val CREDENTIAL_BOOTSTRAP_INTERVAL_MS = 24 * 60 * 60_000L
+    private const val MAX_MEASUREMENT_GEO_REFRESH_ATTEMPTS = 12
     private val runtimeCircuitOpen = AtomicBoolean(false)
 
     private enum class RuntimeCircuitReason(val wireValue: String) {
@@ -871,6 +878,10 @@ object TrackHub {
             .remove(SESSION_SEQ_KEY)
             .remove(LAST_BACKGROUND_KEY)
             .remove(COUNTRY_CODE_KEY)
+            .remove(MEASUREMENT_COUNTRY_KEY)
+            .remove(MEASUREMENT_EEA_KEY)
+            .remove(MEASUREMENT_GEO_INSTALL_UID_KEY)
+            .remove(MEASUREMENT_GEO_REFRESH_TERMINAL_KEY)
             .remove(AD_USER_DATA_KEY)
             .remove(AD_PERSONALIZATION_KEY)
             .remove(EEA_KEY)
@@ -1054,6 +1065,37 @@ object TrackHub {
         val hasCredential = ingestToken?.let {
             loadInstallCredential(context, it, installUid)
         } != null
+        val production = integrationTestToken == null
+        if (production && installAlreadySent && hasCredential) {
+            val hasCachedGeo = hasCachedMeasurementGeography(prefs, installUid)
+            val refreshTerminal = prefs.getString(
+                MEASUREMENT_GEO_REFRESH_TERMINAL_KEY,
+                null,
+            ) == installUid
+            val refreshPending = hasPendingReport(
+                context,
+                MEASUREMENT_GEO_REFRESH_DEDUPE_KEY,
+            )
+            if (shouldRefreshMeasurementGeography(
+                    installAlreadySent = installAlreadySent,
+                    hasCredential = hasCredential,
+                    hasCachedGeo = hasCachedGeo,
+                    refreshTerminal = refreshTerminal,
+                    refreshPending = refreshPending,
+                )
+            ) {
+                val queued = sendInstall(
+                    context = context,
+                    prefs = prefs,
+                    referrer = null,
+                    dedupeKey = MEASUREMENT_GEO_REFRESH_DEDUPE_KEY,
+                    beginSession = false,
+                    kindOverride = MEASUREMENT_GEO_REFRESH_KIND,
+                )
+                if (queued) log("measurement geography refresh queued")
+            }
+            return false
+        }
         val bootstrapKey = installCredentialBootstrapKey(ingestToken ?: return false)
         if (integrationTestToken == null && !shouldReportInstallForCredential(
             installAlreadySent,
@@ -1124,8 +1166,9 @@ object TrackHub {
         referrer: String?,
         dedupeKey: String = "install",
         beginSession: Boolean = true,
-    ) {
-        if (runtimeCircuitOpen.get()) return
+        kindOverride: String? = null,
+    ): Boolean {
+        if (runtimeCircuitOpen.get()) return false
         val uid = installUid(context)
         deferredMatchToken(referrer)?.let { matchToken ->
             prefs.edit().putString(DEFERRED_MATCH_TOKEN_KEY, matchToken).apply()
@@ -1139,7 +1182,7 @@ object TrackHub {
             .put("sdk_version", SDK_VERSION)
             .put("os_version", Build.VERSION.RELEASE ?: "")
             .put("occurred_at", iso8601(firstOpenAt(context)))
-        explicitCountryCode(prefs)?.let { body.put("country", it) }
+        appendMeasurementGeography(prefs, uid, body)
         body.put("locale", Locale.getDefault().toString())
         body.put("device_model", Build.MODEL ?: "Android")
         body.put("build", Build.ID ?: "")
@@ -1157,7 +1200,7 @@ object TrackHub {
         val accepted = sendOrQueue(
             path = "install",
             rawBody = body.toString(),
-            kind = when {
+            kind = kindOverride ?: when {
                 !production -> "test_install"
                 dedupeKey == "install" -> "production_install"
                 else -> "production_install_referrer"
@@ -1172,6 +1215,7 @@ object TrackHub {
             }
         }
         if (accepted && beginSession) beginSessionIfNeeded(context)
+        return accepted
     }
 
     internal fun deferredMatchToken(referrer: String?): String? {
@@ -1192,7 +1236,6 @@ object TrackHub {
     private fun appendConsent(prefs: android.content.SharedPreferences, body: JSONObject) {
         if (prefs.contains(AD_USER_DATA_KEY)) body.put("ad_user_data", prefs.getBoolean(AD_USER_DATA_KEY, false))
         if (prefs.contains(AD_PERSONALIZATION_KEY)) body.put("ad_personalization", prefs.getBoolean(AD_PERSONALIZATION_KEY, false))
-        if (prefs.contains(EEA_KEY)) body.put("eea", prefs.getBoolean(EEA_KEY, false))
         if (prefs.contains(PIPL_CONSENT_KEY)) body.put("pipl_consent", prefs.getBoolean(PIPL_CONSENT_KEY, false))
         if (prefs.contains(CROSS_BORDER_TRANSFER_CONSENT_KEY)) {
             body.put("cross_border_transfer_consent", prefs.getBoolean(CROSS_BORDER_TRANSFER_CONSENT_KEY, false))
@@ -1265,6 +1308,7 @@ object TrackHub {
             .put("platform", "android")
             .put("sdk_name", "trackhub-android")
             .put("sdk_version", SDK_VERSION)
+        appendMeasurementGeography(prefs, uid, body)
         appendAdvertisingId(context, prefs, body)
         appendConsent(prefs, body)
         sendOrQueue("install", body.toString())
@@ -1514,7 +1558,7 @@ object TrackHub {
             .put("device_model", Build.MODEL ?: "Android")
             .put("build", Build.ID ?: "")
         appVersion(context)?.let { body.put("app_version", it) }
-        explicitCountryCode(prefs)?.let { body.put("country", it) }
+        appendMeasurementGeography(prefs, installUid(context), body)
         if (collectAdvertisingId && prefs.getBoolean(AD_USER_DATA_KEY, false)) {
             val advertisingId = prefs.getString(ADVERTISING_ID_KEY, null)?.takeIf { it.isNotBlank() }
             if (advertisingId != null) {
@@ -1534,6 +1578,174 @@ object TrackHub {
 
     private fun explicitCountryCode(prefs: android.content.SharedPreferences): String? =
         normalizedCountryCode(prefs.getString(COUNTRY_CODE_KEY, null))
+
+    internal data class MeasurementGeographyAck(
+        val version: Int?,
+        val country: String?,
+        val eea: Boolean?,
+    )
+
+    internal data class MeasurementGeographySignal(
+        val country: String?,
+        val eea: Boolean?,
+    )
+
+    internal fun parseMeasurementGeographyAck(
+        countryValue: Any?,
+        eeaValue: Any?,
+        geoAckVersionValue: Any?,
+        responseInstallUid: String?,
+        expectedInstallUid: String,
+    ): MeasurementGeographyAck? {
+        if (responseInstallUid != null && responseInstallUid != expectedInstallUid) return null
+        val country = when (countryValue) {
+            null -> null
+            is String -> normalizedCountryCode(countryValue) ?: return null
+            else -> return null
+        }
+        val eea = when (eeaValue) {
+            null -> null
+            is Boolean -> eeaValue
+            else -> return null
+        }
+        return MeasurementGeographyAck(
+            version = when (geoAckVersionValue) {
+                is Int -> geoAckVersionValue.takeIf { it == 1 }
+                is Long -> geoAckVersionValue.toInt().takeIf { geoAckVersionValue == 1L }
+                else -> null
+            },
+            country = country,
+            eea = eea,
+        )
+    }
+
+    internal fun resolvedMeasurementEea(host: Boolean?, cached: Boolean?): Boolean? = when {
+        host == true || cached == true -> true
+        host != null || cached != null -> false
+        else -> null
+    }
+
+    internal fun resolvedMeasurementGeography(
+        hostCountry: String?,
+        hostEea: Boolean?,
+        cachedCountry: String?,
+        cachedEea: Boolean?,
+    ): MeasurementGeographySignal = MeasurementGeographySignal(
+        country = normalizedCountryCode(cachedCountry)
+            ?: normalizedCountryCode(hostCountry),
+        eea = resolvedMeasurementEea(hostEea, cachedEea),
+    )
+
+    internal fun shouldRefreshMeasurementGeography(
+        installAlreadySent: Boolean,
+        hasCredential: Boolean,
+        hasCachedGeo: Boolean,
+        refreshTerminal: Boolean,
+        refreshPending: Boolean,
+    ): Boolean = installAlreadySent && hasCredential && !hasCachedGeo &&
+        !refreshTerminal && !refreshPending
+
+    internal fun shouldTerminateMeasurementGeoRefresh(attempts: Int): Boolean =
+        attempts >= MAX_MEASUREMENT_GEO_REFRESH_ATTEMPTS
+
+    internal fun shouldAwaitMeasurementGeoAck(
+        statusIsSuccess: Boolean,
+        ackVersion: Int?,
+    ): Boolean = statusIsSuccess && ackVersion != 1
+
+    private fun hasCachedMeasurementGeography(
+        prefs: android.content.SharedPreferences,
+        installUid: String,
+    ): Boolean {
+        if (prefs.getString(MEASUREMENT_GEO_INSTALL_UID_KEY, null) != installUid) return false
+        return normalizedCountryCode(prefs.getString(MEASUREMENT_COUNTRY_KEY, null)) != null ||
+            prefs.contains(MEASUREMENT_EEA_KEY)
+    }
+
+    private fun appendMeasurementGeography(
+        prefs: android.content.SharedPreferences,
+        installUid: String,
+        body: JSONObject,
+    ) {
+        val cacheMatchesInstall = prefs.getString(
+            MEASUREMENT_GEO_INSTALL_UID_KEY,
+            null,
+        ) == installUid
+        val cachedCountry = if (cacheMatchesInstall) {
+            normalizedCountryCode(prefs.getString(MEASUREMENT_COUNTRY_KEY, null))
+        } else null
+
+        val hostEea = if (prefs.contains(EEA_KEY)) prefs.getBoolean(EEA_KEY, false) else null
+        val cachedEea = if (cacheMatchesInstall && prefs.contains(MEASUREMENT_EEA_KEY)) {
+            prefs.getBoolean(MEASUREMENT_EEA_KEY, false)
+        } else null
+        val signal = resolvedMeasurementGeography(
+            hostCountry = explicitCountryCode(prefs),
+            hostEea = hostEea,
+            cachedCountry = cachedCountry,
+            cachedEea = cachedEea,
+        )
+        signal.country?.let { body.put("country", it) }
+        signal.eea?.let { body.put("eea", it) }
+    }
+
+    private fun saveMeasurementGeography(context: Context, responseBody: String?): Boolean {
+        val json = runCatchingException { JSONObject(responseBody ?: return false) }.getOrNull()
+            ?: return false
+        val installUid = installUid(context)
+        val responseInstallUid = if (json.has("install_uid")) json.optString("install_uid") else null
+        val ack = parseMeasurementGeographyAck(
+            countryValue = json.opt("country").takeUnless { it == JSONObject.NULL },
+            eeaValue = json.opt("eea").takeUnless { it == JSONObject.NULL },
+            geoAckVersionValue = json.opt("geo_ack_version").takeUnless { it == JSONObject.NULL },
+            responseInstallUid = responseInstallUid,
+            expectedInstallUid = installUid,
+        ) ?: return false
+        if (ack.version != 1 || (ack.country == null && ack.eea == null)) return false
+
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val edit = prefs.edit()
+        if (prefs.getString(MEASUREMENT_GEO_INSTALL_UID_KEY, null) != installUid) {
+            edit.remove(MEASUREMENT_COUNTRY_KEY).remove(MEASUREMENT_EEA_KEY)
+        }
+        ack.country?.let { edit.putString(MEASUREMENT_COUNTRY_KEY, it) }
+        ack.eea?.let { edit.putBoolean(MEASUREMENT_EEA_KEY, it) }
+        edit.putString(MEASUREMENT_GEO_INSTALL_UID_KEY, installUid)
+        val stored = edit.commit()
+        if (stored) log("server-resolved measurement geography cached")
+        else log("server-resolved measurement geography could not be cached")
+        return stored
+    }
+
+    private fun hasMeasurementGeoAckV1(context: Context, responseBody: String?): Boolean {
+        val json = runCatchingException { JSONObject(responseBody ?: return false) }.getOrNull()
+            ?: return false
+        val expectedInstallUid = installUid(context)
+        return parseMeasurementGeographyAck(
+            countryValue = json.opt("country").takeUnless { it == JSONObject.NULL },
+            eeaValue = json.opt("eea").takeUnless { it == JSONObject.NULL },
+            geoAckVersionValue = json.opt("geo_ack_version").takeUnless { it == JSONObject.NULL },
+            responseInstallUid = if (json.has("install_uid")) json.optString("install_uid") else null,
+            expectedInstallUid = expectedInstallUid,
+        )?.version == 1
+    }
+
+    private fun markMeasurementGeoRefreshTerminal(
+        prefs: android.content.SharedPreferences,
+        installUid: String,
+    ) {
+        if (!prefs.edit().putString(MEASUREMENT_GEO_REFRESH_TERMINAL_KEY, installUid).commit()) {
+            log("measurement geography refresh marker could not be persisted")
+        }
+    }
+
+    private fun hasPendingReport(context: Context, dedupeKey: String): Boolean {
+        val items = loadPending(context, pendingReportsKey())
+        for (index in 0 until items.length()) {
+            if (items.optJSONObject(index)?.optString("dedupe_key") == dedupeKey) return true
+        }
+        return false
+    }
 
     /**
      * Persist first, then let a single bounded delivery worker drain the queue.
@@ -1908,9 +2120,27 @@ object TrackHub {
         }
         if (index < 0) return
         val correctedClock = code == 401 && applyServerClock(responseBody)
-        if (correctedClock || isRetryable(code)) {
-            val item = items.getJSONObject(index)
+        val waitingForGeoAck = pending.kind == MEASUREMENT_GEO_REFRESH_KIND &&
+            shouldAwaitMeasurementGeoAck(
+                statusIsSuccess = code in 200..299,
+                ackVersion = if (hasMeasurementGeoAckV1(context, responseBody)) 1 else null,
+            )
+        if (correctedClock || isRetryable(code) || waitingForGeoAck) {
             val attempts = pending.attempts + 1
+            if (pending.kind == MEASUREMENT_GEO_REFRESH_KIND &&
+                shouldTerminateMeasurementGeoRefresh(attempts)
+            ) {
+                items.remove(index)
+                if (!persistPending(context, queueKey, items)) {
+                    log("measurement geography refresh could not be retired")
+                    openRuntimeCircuit(RuntimeCircuitReason.STORAGE, "geo refresh queue removal")
+                    return
+                }
+                markMeasurementGeoRefreshTerminal(prefs, installUid(context))
+                log("measurement geography refresh exhausted its bounded retries")
+                return
+            }
+            val item = items.getJSONObject(index)
             val delayMs = if (correctedClock && attempts <= 3) {
                 1_000L
             } else {
@@ -1928,7 +2158,13 @@ object TrackHub {
                 log("${pending.path} retry state could not be persisted")
                 openRuntimeCircuit(RuntimeCircuitReason.STORAGE, "offline retry state persistence")
             }
-            log(if (correctedClock) "device clock corrected — retrying ${pending.path}" else "${pending.path} delivery failed — retrying with backoff")
+            log(
+                when {
+                    correctedClock -> "device clock corrected — retrying ${pending.path}"
+                    waitingForGeoAck -> "measurement geography contract not active — retrying with backoff"
+                    else -> "${pending.path} delivery failed — retrying with backoff"
+                },
+            )
             return
         }
 
@@ -1941,7 +2177,18 @@ object TrackHub {
         if (code == 401) {
             openRuntimeCircuit(RuntimeCircuitReason.CREDENTIALS, "SDK credentials rejected")
         }
+        if (pending.kind == MEASUREMENT_GEO_REFRESH_KIND && code !in 200..299) {
+            markMeasurementGeoRefreshTerminal(prefs, installUid(context))
+        }
         if (code in 200..299) {
+            // Any successful production /install ACK may replace the cached
+            // first-party geography. Test Lab must not contaminate it.
+            if (pending.path == "install" && pending.kind != "test_install") {
+                if (hasMeasurementGeoAckV1(context, responseBody)) {
+                    saveMeasurementGeography(context, responseBody)
+                    markMeasurementGeoRefreshTerminal(prefs, installUid(context))
+                }
+            }
             when (pending.kind) {
                 "production_install" -> {
                     prefs.edit().putBoolean(INSTALL_SENT_KEY, true).commit()
@@ -1951,6 +2198,10 @@ object TrackHub {
                     sendConsentUpdate(context)
                     fetchAttributionIfNeeded()
                     resolveDeferredDeepLinkIfNeeded()
+                }
+                "production_install_referrer" -> Unit
+                MEASUREMENT_GEO_REFRESH_KIND -> {
+                    log("measurement geography refresh acknowledged")
                 }
                 "test_install" -> log("integration-test install reported")
                 "external_identity" -> {

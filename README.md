@@ -1,6 +1,7 @@
 # TrackHub Android SDK 3.0
 
-> Current release: `3.0.1` · minSdk 26 · Java/JVM 17 · no billing-SDK dependency
+> Current public release: `3.0.1` · next patch `3.0.2` is gated on the matching
+> Daively `/install` geography contract · minSdk 26 · Java/JVM 17
 
 TrackHub measures installations, 30-minute sessions, engagement and bounded
 Google/OpenAI click context. Apphud, RevenueCat and other billing SDKs remain
@@ -56,8 +57,14 @@ TrackHub.gdprForgetMe(applicationContext)
 ```
 
 Country is optional actual measurement geography, not language, and is not read
-from Apphud. A trusted edge country can override it. Unknown consent is never
-treated as granted.
+from Apphud. From 3.0.2, a successful production install response may return
+trusted-edge `country` / `eea`; the SDK validates and durably caches them for
+later payloads. `countryCode` is only an initial host fallback and may be
+replaced by that result. Host EEA true OR cached EEA true stays protective;
+cached false cannot narrow host true. TrackHub does not infer geography from
+Locale or GPS and never discovers, persists or sends an IP address. The server
+still re-evaluates every request and remains authoritative. Unknown consent is
+never treated as granted.
 
 The disk-first bounded queue protects install and transaction context. Network
 outages retry and do not trip the runtime circuit. Internal storage/codec/
