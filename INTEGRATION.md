@@ -23,6 +23,24 @@ The desired identity is persisted immediately, but production delivery waits
 for the install acknowledgement. Test Lab remains independent. Version 3.0.1
 also lets a queued production install pass a blocked 3.0.0 identity head.
 
+## Owner-controlled Android identifiers (3.0.5)
+
+GAID and App Set ID collection is off by default and controlled per app by an
+owner-only switch in Daively. On the first launch, the SDK joins the setting
+with Play Install Referrer before enqueueing the install, bounded by a three-
+second fail-closed watchdog; application startup never waits. When enabled, it
+reads GAID and falls back to App Set ID, then backfills later context if the
+control-plane response arrives after that bounded first-open window.
+The setting refreshes on launch and foreground (at most once per minute), which
+also provides a remote kill switch without another app release.
+
+The Google runtimes and `AD_ID` permission ship with 3.0.5 so enabling the
+switch is effective on released builds. Missing or non-functional Google Play
+Services fail soft. Consent fields remain truthful metadata but do not block
+identifier collection after the owner enables it. A host may still set
+`collectAdvertisingId = false` as a local emergency opt-out; it cannot override
+the server's default-off gate in the enabling direction.
+
 ## Server-owned measurement geography (3.0.3)
 
 The SDK does not learn or cache the server's geography result. On every
@@ -53,7 +71,8 @@ changes either Google consent value; the independent server default does.
 
 Public measurement, deep-link, consent, attribution, push-token, purchase
 context and erasure methods remain asynchronous. Sessions coalesce for 30
-minutes in background; a captured deep link can force a new session.
+minutes in background; a captured `gclid`, `gbraid`, or `wbraid` deep link can
+force a new session and is cleared only after that session is durably queued.
 
 ## Optional engagement-event deduplication
 

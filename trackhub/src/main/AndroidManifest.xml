@@ -2,4 +2,6 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- Install reporting needs network access. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Collection is still off until the app owner enables the remote flag. -->
+    <uses-permission android:name="com.google.android.gms.permission.AD_ID" />
 </manifest>

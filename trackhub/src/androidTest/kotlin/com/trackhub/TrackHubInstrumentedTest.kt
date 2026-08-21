@@ -43,7 +43,7 @@ class TrackHubInstrumentedTest {
     }
 
     @Test
-    fun signedTestLabPayloadRetriesOfflineWithoutAdvertisingIdPermission() {
+    fun signedTestLabPayloadRetriesOfflineWithRemoteAdvertisingIdControl() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val testToken = "test-run-token-with-enough-entropy-1234"
         val prefs = context.getSharedPreferences("trackhub", Context.MODE_PRIVATE)
@@ -57,19 +57,37 @@ class TrackHubInstrumentedTest {
         val allowTrackRecovery = AtomicBoolean(false)
         val installRequest = AtomicReference<RecordedRequest?>()
         val sessionRequest = AtomicReference<RecordedRequest?>()
+        val wbraidSessionRequest = AtomicReference<RecordedRequest?>()
         val firstFailedTrackRequest = AtomicReference<RecordedRequest?>()
         val lifecycleRequestsSeen = CountDownLatch(2)
+        val wbraidSessionSeen = CountDownLatch(1)
+        val remoteConfigSeen = CountDownLatch(1)
+        val remoteConfigResponded = AtomicBoolean(false)
+        val installObservedResolvedConfig = AtomicBoolean(false)
         val firstFailedTrackSeen = CountDownLatch(1)
         val recoveredTrackSeen = CountDownLatch(1)
         val server = MockWebServer()
         server.dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
+                if (request.path?.endsWith("/sdk/config") == true) {
+                    remoteConfigSeen.countDown()
+                    remoteConfigResponded.set(true)
+                    return MockResponse().setResponseCode(200).setBody(
+                        "{\"androidAdvertisingIdCollectionEnabled\":false}",
+                    )
+                }
                 when {
                     request.path?.endsWith("/install") == true &&
-                        installRequest.compareAndSet(null, request) -> lifecycleRequestsSeen.countDown()
+                        installRequest.compareAndSet(null, request) -> {
+                            installObservedResolvedConfig.set(remoteConfigResponded.get())
+                            lifecycleRequestsSeen.countDown()
+                        }
 
                     request.path?.endsWith("/sdk/session") == true &&
                         sessionRequest.compareAndSet(null, request) -> lifecycleRequestsSeen.countDown()
+
+                    request.path?.endsWith("/sdk/session") == true &&
+                        wbraidSessionRequest.compareAndSet(null, request) -> wbraidSessionSeen.countDown()
                 }
                 val isTrack = request.path?.contains("/sdk/track") == true
                 // Snapshot the response decision before releasing the test
@@ -130,8 +148,22 @@ class TrackHubInstrumentedTest {
             )
             val installBody = JSONObject(requireNotNull(installRequest.get()).body.readUtf8())
             val sessionBody = JSONObject(requireNotNull(sessionRequest.get()).body.readUtf8())
+            assertTrue("TrackHub did not fetch remote SDK config", remoteConfigSeen.await(30, TimeUnit.SECONDS))
+            assertTrue("initial install raced ahead of resolved remote config", installObservedResolvedConfig.get())
             assertEquals("chatgpt-click-123", installBody.getString("oppref"))
             assertEquals("chatgpt-click-123", sessionBody.getString("oppref"))
+            assertFalse(installBody.has("device_id"))
+
+            assertTrue(
+                TrackHub.handleDeepLink(
+                    context,
+                    Uri.parse("https://app.example/open?wbraid=web-to-app-MixedCase-123"),
+                ),
+            )
+            assertTrue("wbraid re-engagement session was not delivered", wbraidSessionSeen.await(30, TimeUnit.SECONDS))
+            val wbraidBody = JSONObject(requireNotNull(wbraidSessionRequest.get()).body.readUtf8())
+            assertEquals("web-to-app-MixedCase-123", wbraidBody.getString("wbraid"))
+            assertFalse(wbraidBody.has("oppref"))
 
             TrackHub.trackEvent("integration_probe", callbackParams = mapOf("screen" to "paywall"))
 
@@ -266,7 +298,7 @@ class TrackHubInstrumentedTest {
                 .requestedPermissions
                 ?.toSet()
                 .orEmpty()
-            assertFalse(permissions.contains("com.google.android.gms.permission.AD_ID"))
+            assertTrue(permissions.contains("com.google.android.gms.permission.AD_ID"))
             assertTrue(permissions.contains("android.permission.INTERNET"))
         } finally {
             TrackHub.resetRuntimeCircuitForTest()
