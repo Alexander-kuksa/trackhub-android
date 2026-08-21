@@ -95,7 +95,7 @@ enum class TrackHubSalesEvent(val value: String) {
 object TrackHub {
 
     /** SDK version reported to the platform for integration detection. */
-    const val SDK_VERSION = "3.0.4"
+    const val SDK_VERSION = "3.0.5"
 
     private const val PREFS = "trackhub"
     private const val INSTALL_SENT_KEY = "install_sent"
@@ -109,8 +109,10 @@ object TrackHub {
     private const val LIMIT_AD_TRACKING_KEY = "limit_ad_tracking"
     private const val PENDING_GCLID_KEY = "pending_gclid"
     private const val PENDING_GBRAID_KEY = "pending_gbraid"
+    private const val PENDING_WBRAID_KEY = "pending_wbraid"
     private const val GCLID_KEY = "gclid"
     private const val GBRAID_KEY = "gbraid"
+    private const val WBRAID_KEY = "wbraid"
     private const val OPENAI_OPPREF_KEY = "openai_oppref"
     private const val PENDING_OPENAI_OPPREF_KEY = "pending_openai_oppref"
     private const val COUNTRY_CODE_KEY = "country_code"
@@ -153,6 +155,7 @@ object TrackHub {
     private const val RETRY_MAX_MS = 5 * 60_000L
     private const val CREDENTIAL_BOOTSTRAP_INTERVAL_MS = 24 * 60 * 60_000L
     private const val REMOTE_CONFIG_REFRESH_MS = 60_000L
+    private const val INITIAL_INSTALL_READINESS_SECONDS = 3L
     private val runtimeCircuitOpen = AtomicBoolean(false)
 
     private enum class RuntimeCircuitReason(val wireValue: String) {
@@ -183,6 +186,7 @@ object TrackHub {
     @Volatile private var appContext: Context? = null
     @Volatile private var pendingGclid: String? = null
     @Volatile private var pendingGbraid: String? = null
+    @Volatile private var pendingWbraid: String? = null
     @Volatile private var pendingOpenAiOppref: String? = null
     @Volatile private var debug = false
     @Volatile private var lifecycleRegistered = false
@@ -317,18 +321,21 @@ object TrackHub {
         normalizedCountryCode(configuration.countryCode)?.let { prefsEdit.putString(COUNTRY_CODE_KEY, it) }
         applyGoogleAdsConsent(prefsEdit, configuration.googleAdsConsent)
         applyPiplConsent(prefsEdit, configuration.piplConsent)
-        val hasPendingGoogleReference = pendingGclid != null || pendingGbraid != null
+        val hasPendingGoogleReference = pendingGclid != null || pendingGbraid != null || pendingWbraid != null
         if (pendingOpenAiOppref != null && !hasPendingGoogleReference) {
             prefsEdit
                 .remove(PENDING_GCLID_KEY)
                 .remove(PENDING_GBRAID_KEY)
+                .remove(PENDING_WBRAID_KEY)
                 .remove(GCLID_KEY)
                 .remove(GBRAID_KEY)
+                .remove(WBRAID_KEY)
         } else if (hasPendingGoogleReference && pendingOpenAiOppref == null) {
             prefsEdit.remove(OPENAI_OPPREF_KEY).remove(PENDING_OPENAI_OPPREF_KEY)
         }
         pendingGclid?.let { prefsEdit.putString(PENDING_GCLID_KEY, it).putString(GCLID_KEY, it) }
         pendingGbraid?.let { prefsEdit.putString(PENDING_GBRAID_KEY, it).putString(GBRAID_KEY, it) }
+        pendingWbraid?.let { prefsEdit.putString(PENDING_WBRAID_KEY, it).putString(WBRAID_KEY, it) }
         pendingOpenAiOppref?.let {
             prefsEdit
                 .putString(OPENAI_OPPREF_KEY, it)
@@ -339,11 +346,13 @@ object TrackHub {
         firstOpenAt(configuredAppContext)
         reportRuntimeCircuitDiagnosticIfNeeded(configuredAppContext)
         runOnMain { registerLifecycle(configuredAppContext) }
-        refreshRemoteSdkConfig(configuredAppContext, force = true)
         val waitingForInstallQueue = reportInstallIfNeeded(configuredAppContext)
         syncPersistedExternalIdentities(configuredAppContext)
         reportPushTokenIfAvailable(configuredAppContext)
-        if (!waitingForInstallQueue) beginSessionIfNeeded(configuredAppContext)
+        if (!waitingForInstallQueue) {
+            refreshRemoteSdkConfig(configuredAppContext, force = true)
+            beginSessionIfNeeded(configuredAppContext)
+        }
         flushPending(configuredAppContext)
         fetchAttributionIfNeeded()
         if (prefs.getBoolean(INSTALL_SENT_KEY, false)) {
@@ -710,6 +719,7 @@ object TrackHub {
         if (trackingDisabled) {
             pendingGclid = null
             pendingGbraid = null
+            pendingWbraid = null
             pendingOpenAiOppref = null
             return false
         }
@@ -718,24 +728,27 @@ object TrackHub {
         // public SDK boundary and must always fail open for the host app.
         if (!uri.isHierarchical) return false
         val parameters = runCatchingException {
-            Triple(
-                uri.getQueryParameter("gclid")?.takeIf { it.isNotEmpty() },
-                uri.getQueryParameter("gbraid")?.takeIf { it.isNotEmpty() },
-                rawOpenAiOpprefFromEncodedQuery(uri.encodedQuery),
+            DeepLinkReferences(
+                gclid = uri.getQueryParameter("gclid")?.takeIf { it.isNotEmpty() },
+                gbraid = uri.getQueryParameter("gbraid")?.takeIf { it.isNotEmpty() },
+                wbraid = uri.getQueryParameter("wbraid")?.takeIf { it.isNotEmpty() },
+                oppref = rawOpenAiOpprefFromEncodedQuery(uri.encodedQuery),
             )
         }.getOrElse {
             log("unsupported deep link — skipped")
             return false
         }
-        val (gclid, gbraid, oppref) = parameters
-        if (gclid == null && gbraid == null && oppref == null) return false
+        val (gclid, gbraid, wbraid, oppref) = parameters
+        if (gclid == null && gbraid == null && wbraid == null && oppref == null) return false
         pendingGclid = gclid
         pendingGbraid = gbraid
+        pendingWbraid = wbraid
         pendingOpenAiOppref = oppref
-        val hasGoogleReference = gclid != null || gbraid != null
+        val hasGoogleReference = gclid != null || gbraid != null || wbraid != null
         if (oppref != null && !hasGoogleReference) {
             pendingGclid = null
             pendingGbraid = null
+            pendingWbraid = null
         } else if (hasGoogleReference && oppref == null) {
             pendingOpenAiOppref = null
         }
@@ -747,13 +760,16 @@ object TrackHub {
                     edit
                         .remove(PENDING_GCLID_KEY)
                         .remove(PENDING_GBRAID_KEY)
+                        .remove(PENDING_WBRAID_KEY)
                         .remove(GCLID_KEY)
                         .remove(GBRAID_KEY)
+                        .remove(WBRAID_KEY)
                 } else if (hasGoogleReference && oppref == null) {
                     edit.remove(OPENAI_OPPREF_KEY).remove(PENDING_OPENAI_OPPREF_KEY)
                 }
                 gclid?.let { edit.putString(PENDING_GCLID_KEY, it).putString(GCLID_KEY, it) }
                 gbraid?.let { edit.putString(PENDING_GBRAID_KEY, it).putString(GBRAID_KEY, it) }
+                wbraid?.let { edit.putString(PENDING_WBRAID_KEY, it).putString(WBRAID_KEY, it) }
                 oppref?.let {
                     edit
                         .putString(OPENAI_OPPREF_KEY, it)
@@ -765,6 +781,13 @@ object TrackHub {
         appContext?.let { configured -> io.execute { beginSessionIfNeeded(configured, force = true) } }
         return true
     }
+
+    private data class DeepLinkReferences(
+        val gclid: String?,
+        val gbraid: String?,
+        val wbraid: String?,
+        val oppref: String?,
+    )
 
     internal fun normalizedOpenAiOppref(raw: String?): String? =
         raw?.takeIf { it.isNotEmpty() && it.length <= 1024 }
@@ -908,8 +931,10 @@ object TrackHub {
             .remove(LIMIT_AD_TRACKING_KEY)
             .remove(PENDING_GCLID_KEY)
             .remove(PENDING_GBRAID_KEY)
+            .remove(PENDING_WBRAID_KEY)
             .remove(GCLID_KEY)
             .remove(GBRAID_KEY)
+            .remove(WBRAID_KEY)
             .remove(OPENAI_OPPREF_KEY)
             .remove(PENDING_OPENAI_OPPREF_KEY)
             .remove(DEFERRED_MATCH_TOKEN_KEY)
@@ -941,6 +966,7 @@ object TrackHub {
         }
         pendingGclid = null
         pendingGbraid = null
+        pendingWbraid = null
         pendingOpenAiOppref = null
         firebaseAppInstanceId = null
     }
@@ -1078,9 +1104,11 @@ object TrackHub {
             .put("started_at", iso8601(Date(now)))
         val gclid = pendingGclid ?: prefs.getString(PENDING_GCLID_KEY, null)
         val gbraid = pendingGbraid ?: prefs.getString(PENDING_GBRAID_KEY, null)
+        val wbraid = pendingWbraid ?: prefs.getString(PENDING_WBRAID_KEY, null)
         val oppref = pendingOpenAiOppref ?: prefs.getString(PENDING_OPENAI_OPPREF_KEY, null)
         gclid?.let { body.put("gclid", it) }
         gbraid?.let { body.put("gbraid", it) }
+        wbraid?.let { body.put("wbraid", it) }
         oppref?.let { body.put("oppref", it) }
         if (sendOrQueue("sdk/session", body.toString())) {
             // Clear one-shot sources only after the exact session payload is
@@ -1088,10 +1116,12 @@ object TrackHub {
             prefs.edit()
                 .remove(PENDING_GCLID_KEY)
                 .remove(PENDING_GBRAID_KEY)
+                .remove(PENDING_WBRAID_KEY)
                 .remove(PENDING_OPENAI_OPPREF_KEY)
                 .apply()
             pendingGclid = null
             pendingGbraid = null
+            pendingWbraid = null
             pendingOpenAiOppref = null
         }
         fetchAttributionIfNeeded()
@@ -1099,15 +1129,26 @@ object TrackHub {
 
     // MARK: - Install reporting
 
-    private fun refreshRemoteSdkConfig(context: Context, force: Boolean = false) {
-        if (trackingDisabled || runtimeCircuitOpen.get()) return
+    private fun refreshRemoteSdkConfig(
+        context: Context,
+        force: Boolean = false,
+        completion: (() -> Unit)? = null,
+    ) {
+        if (trackingDisabled || runtimeCircuitOpen.get()) {
+            completion?.invoke()
+            return
+        }
         val now = SystemClock.elapsedRealtime()
-        if (!force && now - remoteSdkConfigLastAttemptElapsedMs < REMOTE_CONFIG_REFRESH_MS) return
+        if (!force && now - remoteSdkConfigLastAttemptElapsedMs < REMOTE_CONFIG_REFRESH_MS) {
+            completion?.invoke()
+            return
+        }
         if (!remoteSdkConfigFetchInFlight.compareAndSet(false, true)) return
         remoteSdkConfigLastAttemptElapsedMs = now
         val config = currentNetworkConfig()
         if (config == null) {
             remoteSdkConfigFetchInFlight.set(false)
+            completion?.invoke()
             return
         }
         auxiliaryNetwork.execute {
@@ -1120,20 +1161,23 @@ object TrackHub {
                 // start() may have switched this singleton to another app key
                 // while the previous request was in flight.
                 if (config.ingestToken != ingestToken) {
-                    appContext?.let { refreshRemoteSdkConfig(it, force = true) }
+                    appContext?.let { refreshRemoteSdkConfig(it, force = true, completion = completion) }
+                        ?: completion?.invoke()
                     return@state
                 }
-                if (serverEnabled == null) return@state
-                val wasEnabled = advertisingIdCollectionEnabled()
-                remoteAdvertisingIdCollectionEnabled = serverEnabled
-                val isEnabled = advertisingIdCollectionEnabled()
-                val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                if (!isEnabled) clearAdvertisingIdentifiers(prefs)
-                if (!wasEnabled && isEnabled && prefs.getBoolean(INSTALL_SENT_KEY, false)) {
-                    // The initial install never waits for control-plane I/O.
-                    // Backfill the identifier as soon as the owner flag arrives.
-                    sendConsentUpdate(context)
+                if (serverEnabled != null) {
+                    val wasEnabled = advertisingIdCollectionEnabled()
+                    remoteAdvertisingIdCollectionEnabled = serverEnabled
+                    val isEnabled = advertisingIdCollectionEnabled()
+                    val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                    if (!isEnabled) clearAdvertisingIdentifiers(prefs)
+                    if (!wasEnabled && isEnabled && prefs.getBoolean(INSTALL_SENT_KEY, false)) {
+                        // A config response after the bounded first-open window
+                        // still enriches later conversions without replaying first_open.
+                        sendConsentUpdate(context)
+                    }
                 }
+                completion?.invoke()
             }
         }
     }
@@ -1184,18 +1228,12 @@ object TrackHub {
         }
 
         val client = InstallReferrerClient.newBuilder(context).build()
-        val initialSent = AtomicBoolean(false)
-        fun finishInitial(referrer: String?) {
-            if (!initialSent.compareAndSet(false, true)) return
-            io.execute { sendInstall(context, prefs, referrer) }
-        }
-        fun finishFromVendor(referrer: String?) {
-            if (initialSent.compareAndSet(false, true)) {
-                io.execute { sendInstall(context, prefs, referrer) }
-            } else if (!referrer.isNullOrBlank()) {
-                // The bounded organic fallback may have fired first. Preserve a
-                // late Play response as a second, idempotent attribution signal
-                // for the same install instead of silently discarding it.
+        val readiness = InitialInstallReadinessGate(
+            onInitialReady = { referrer -> io.execute { sendInstall(context, prefs, referrer) } },
+            onLateReferrer = { referrer ->
+                // The bounded fallback may have fired first. Preserve a late
+                // Play response as an idempotent attribution signal for the
+                // same installation instead of replaying first_open.
                 io.execute {
                     sendInstall(
                         context,
@@ -1205,12 +1243,17 @@ object TrackHub {
                         beginSession = false,
                     )
                 }
-            }
-            runCatchingException { client.endConnection() }
-        }
-        // Some vendor implementations neither connect nor disconnect. A
-        // bounded fallback keeps the install/session queue moving as organic.
-        scheduleWatchdog("install referrer fallback", 3, TimeUnit.SECONDS) { finishInitial(null) }
+            },
+        )
+        // First-open delivery waits for both owner config and Play Referrer,
+        // but never blocks the host app and never waits beyond this watchdog.
+        refreshRemoteSdkConfig(context, force = true, completion = readiness::resolveRemoteConfig)
+        scheduleWatchdog(
+            "initial install readiness fallback",
+            INITIAL_INSTALL_READINESS_SECONDS,
+            TimeUnit.SECONDS,
+            readiness::onTimeout,
+        )
         scheduleWatchdog("install referrer cleanup", 30, TimeUnit.SECONDS) {
             runCatchingException { client.endConnection() }
         }
@@ -1222,17 +1265,20 @@ object TrackHub {
                             client.installReferrer.installReferrer
                         } else null
                     }.getOrNull()
-                    finishFromVendor(referrer)
+                    readiness.resolveReferrer(referrer)
+                    runCatchingException { client.endConnection() }
                 }
 
                 override fun onInstallReferrerServiceDisconnected() {
                     // referrer unavailable — still report the install (organic)
-                    finishFromVendor(null)
+                    readiness.resolveReferrer(null)
+                    runCatchingException { client.endConnection() }
                 }
             })
         }.onFailure {
             log("Install Referrer unavailable — reporting organic install")
-            finishFromVendor(null)
+            readiness.resolveReferrer(null)
+            runCatchingException { client.endConnection() }
         }
         return true
     }
@@ -1266,6 +1312,7 @@ object TrackHub {
         if (!referrer.isNullOrEmpty()) body.put("install_referrer", referrer)
         prefs.getString(GCLID_KEY, null)?.let { body.put("gclid", it) }
         prefs.getString(GBRAID_KEY, null)?.let { body.put("gbraid", it) }
+        prefs.getString(WBRAID_KEY, null)?.let { body.put("wbraid", it) }
         prefs.getString(OPENAI_OPPREF_KEY, null)?.let { body.put("oppref", it) }
         appendAdvertisingId(context, prefs, body)
         // Firebase app_instance_id (GA4 join key for server-confirmed conversions).

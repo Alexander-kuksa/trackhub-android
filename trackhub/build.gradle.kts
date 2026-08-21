@@ -60,7 +60,7 @@ publishing {
             // Local publishing keeps stable TrackHub defaults.
             groupId = providers.gradleProperty("group").orElse("com.trackhub").get()
             artifactId = "trackhub-android"
-            version = providers.gradleProperty("version").orElse("3.0.4").get()
+            version = providers.gradleProperty("version").orElse("3.0.5").get()
             afterEvaluate { from(components["release"]) }
         }
     }
