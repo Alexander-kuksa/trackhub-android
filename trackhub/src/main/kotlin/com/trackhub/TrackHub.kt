@@ -9,6 +9,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.AtomicFile
 import com.google.android.gms.ads.identifier.AdvertisingIdClient
 import com.google.android.gms.appset.AppSet
@@ -94,7 +95,7 @@ enum class TrackHubSalesEvent(val value: String) {
 object TrackHub {
 
     /** SDK version reported to the platform for integration detection. */
-    const val SDK_VERSION = "3.0.3"
+    const val SDK_VERSION = "3.0.4"
 
     private const val PREFS = "trackhub"
     private const val INSTALL_SENT_KEY = "install_sent"
@@ -140,6 +141,7 @@ object TrackHub {
     private const val PIPL_CONSENT_KEY = "consent_pipl"
     private const val CROSS_BORDER_TRANSFER_CONSENT_KEY = "consent_cross_border_transfer"
     private const val ADS_MEASUREMENT_CONSENT_KEY = "consent_ads_measurement"
+    private const val REMOTE_AD_ID_CONFIG_KEY = "androidAdvertisingIdCollectionEnabled"
     private const val SESSION_TIMEOUT_MS = 30 * 60_000L
     private const val MAX_PENDING_REPORTS = 1000
     private const val MAX_PENDING_BYTES = 4 * 1024 * 1024
@@ -150,6 +152,7 @@ object TrackHub {
     private const val RETRY_BASE_MS = 1_000L
     private const val RETRY_MAX_MS = 5 * 60_000L
     private const val CREDENTIAL_BOOTSTRAP_INTERVAL_MS = 24 * 60 * 60_000L
+    private const val REMOTE_CONFIG_REFRESH_MS = 60_000L
     private val runtimeCircuitOpen = AtomicBoolean(false)
 
     private enum class RuntimeCircuitReason(val wireValue: String) {
@@ -183,13 +186,16 @@ object TrackHub {
     @Volatile private var pendingOpenAiOppref: String? = null
     @Volatile private var debug = false
     @Volatile private var lifecycleRegistered = false
-    @Volatile private var collectAdvertisingId = false
+    @Volatile private var collectAdvertisingId = true
+    @Volatile private var remoteAdvertisingIdCollectionEnabled = false
     @Volatile private var attributionChangedHandler: TrackHubAttributionChangedHandler? = null
     @Volatile private var deferredDeepLinkHandler: TrackHubDeferredDeepLinkHandler? = null
     @Volatile private var currentAttribution: TrackHubAttribution? = null
     @Volatile private var attributionFetchInFlight = false
     @Volatile private var deferredResolveInFlight = false
     @Volatile private var trackingDisabled = false
+    private val remoteSdkConfigFetchInFlight = AtomicBoolean(false)
+    @Volatile private var remoteSdkConfigLastAttemptElapsedMs = 0L
     private val privacyStopRequested = AtomicBoolean(false)
     @Volatile private var erasureInFlight = false
     @Volatile private var pendingErasureCompletion: ((Boolean) -> Unit)? = null
@@ -244,6 +250,9 @@ object TrackHub {
         this.endpoint = decoded.endpoint
         this.ingestToken = decoded.ingestToken
         this.sdkSecret = decoded.sdkSecret
+        // Every process/app-key start fails closed until this app's server
+        // setting is fetched. A previous app configuration must never leak.
+        this.remoteAdvertisingIdCollectionEnabled = false
         // SharedPreferences may synchronously parse a legacy multi-megabyte
         // queue XML. Keep every storage read/migration off the host app's main
         // thread; start is intentionally non-blocking.
@@ -330,6 +339,7 @@ object TrackHub {
         firstOpenAt(configuredAppContext)
         reportRuntimeCircuitDiagnosticIfNeeded(configuredAppContext)
         runOnMain { registerLifecycle(configuredAppContext) }
+        refreshRemoteSdkConfig(configuredAppContext, force = true)
         val waitingForInstallQueue = reportInstallIfNeeded(configuredAppContext)
         syncPersistedExternalIdentities(configuredAppContext)
         reportPushTokenIfAvailable(configuredAppContext)
@@ -711,7 +721,7 @@ object TrackHub {
             Triple(
                 uri.getQueryParameter("gclid")?.takeIf { it.isNotEmpty() },
                 uri.getQueryParameter("gbraid")?.takeIf { it.isNotEmpty() },
-                normalizedOpenAiOppref(uri.getQueryParameter("oppref")),
+                rawOpenAiOpprefFromEncodedQuery(uri.encodedQuery),
             )
         }.getOrElse {
             log("unsupported deep link — skipped")
@@ -757,7 +767,18 @@ object TrackHub {
     }
 
     internal fun normalizedOpenAiOppref(raw: String?): String? =
-        raw?.trim()?.takeIf { it.isNotEmpty() && it.length <= 1024 }
+        raw?.takeIf { it.isNotEmpty() && it.length <= 1024 }
+
+    internal fun rawOpenAiOpprefFromEncodedQuery(encodedQuery: String?): String? {
+        val raw = encodedQuery
+            ?.split('&')
+            ?.firstNotNullOfOrNull { pair ->
+                val separator = pair.indexOf('=')
+                if (separator <= 0 || pair.substring(0, separator) != "oppref") null
+                else pair.substring(separator + 1)
+            }
+        return normalizedOpenAiOppref(raw)
+    }
 
     private fun hasPersistedPrivacyDisable(context: Context): Boolean =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -1019,6 +1040,7 @@ object TrackHub {
                     if (trackingDisabled) {
                         retryPendingErasure()
                     } else {
+                        refreshRemoteSdkConfig(context)
                         if (!reportInstallIfNeeded(context)) beginSessionIfNeeded(context)
                     }
                 }
@@ -1076,6 +1098,72 @@ object TrackHub {
     }
 
     // MARK: - Install reporting
+
+    private fun refreshRemoteSdkConfig(context: Context, force: Boolean = false) {
+        if (trackingDisabled || runtimeCircuitOpen.get()) return
+        val now = SystemClock.elapsedRealtime()
+        if (!force && now - remoteSdkConfigLastAttemptElapsedMs < REMOTE_CONFIG_REFRESH_MS) return
+        if (!remoteSdkConfigFetchInFlight.compareAndSet(false, true)) return
+        remoteSdkConfigLastAttemptElapsedMs = now
+        val config = currentNetworkConfig()
+        if (config == null) {
+            remoteSdkConfigFetchInFlight.set(false)
+            return
+        }
+        auxiliaryNetwork.execute {
+            val (code, raw) = getForResponse(config, "sdk/config")
+            val serverEnabled = if (code in 200..299) {
+                parseRemoteAdvertisingIdCollectionEnabled(raw)
+            } else null
+            io.execute state@{
+                remoteSdkConfigFetchInFlight.set(false)
+                // start() may have switched this singleton to another app key
+                // while the previous request was in flight.
+                if (config.ingestToken != ingestToken) {
+                    appContext?.let { refreshRemoteSdkConfig(it, force = true) }
+                    return@state
+                }
+                if (serverEnabled == null) return@state
+                val wasEnabled = advertisingIdCollectionEnabled()
+                remoteAdvertisingIdCollectionEnabled = serverEnabled
+                val isEnabled = advertisingIdCollectionEnabled()
+                val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                if (!isEnabled) clearAdvertisingIdentifiers(prefs)
+                if (!wasEnabled && isEnabled && prefs.getBoolean(INSTALL_SENT_KEY, false)) {
+                    // The initial install never waits for control-plane I/O.
+                    // Backfill the identifier as soon as the owner flag arrives.
+                    sendConsentUpdate(context)
+                }
+            }
+        }
+    }
+
+    internal fun parseRemoteAdvertisingIdCollectionEnabled(raw: String?): Boolean? =
+        runCatchingException {
+            val body = raw?.takeIf { it.toByteArray(Charsets.UTF_8).size <= 4096 }
+                ?: return@runCatchingException null
+            val value = JSONObject(body).opt(REMOTE_AD_ID_CONFIG_KEY)
+            value as? Boolean
+        }.getOrNull()
+
+    private fun advertisingIdCollectionEnabled(): Boolean =
+        shouldCollectAdvertisingId(
+            hostCapabilityEnabled = collectAdvertisingId,
+            ownerRemoteEnabled = remoteAdvertisingIdCollectionEnabled,
+        )
+
+    internal fun shouldCollectAdvertisingId(
+        hostCapabilityEnabled: Boolean,
+        ownerRemoteEnabled: Boolean,
+    ): Boolean = hostCapabilityEnabled && ownerRemoteEnabled
+
+    private fun clearAdvertisingIdentifiers(prefs: android.content.SharedPreferences) {
+        prefs.edit()
+            .remove(ADVERTISING_ID_KEY)
+            .remove(APP_SET_ID_KEY)
+            .remove(LIMIT_AD_TRACKING_KEY)
+            .apply()
+    }
 
     private fun reportInstallIfNeeded(context: Context): Boolean {
         if (trackingDisabled || runtimeCircuitOpen.get()) return false
@@ -1238,10 +1326,12 @@ object TrackHub {
         prefs: android.content.SharedPreferences,
         body: JSONObject,
     ) {
-        if (!collectAdvertisingId || !prefs.getBoolean(AD_USER_DATA_KEY, false)) return
+        if (!advertisingIdCollectionEnabled()) return
         val info = try {
             AdvertisingIdClient.getAdvertisingIdInfo(context)
         } catch (_: Exception) {
+            null
+        } catch (_: LinkageError) {
             null
         }
         val id = info?.id?.takeIf {
@@ -1259,8 +1349,7 @@ object TrackHub {
             prefs.edit().remove(ADVERTISING_ID_KEY).putBoolean(LIMIT_AD_TRACKING_KEY, true).apply()
             val appSetId = resolveAppSetId(context, prefs)
             if (appSetId != null) {
-                val limited = info?.isLimitAdTrackingEnabled
-                    ?: !prefs.getBoolean(AD_PERSONALIZATION_KEY, false)
+                val limited = info?.isLimitAdTrackingEnabled ?: false
                 body.put("device_id", appSetId)
                 body.put("device_id_type", "appsetid")
                 body.put("limit_ad_tracking", limited)
@@ -1277,6 +1366,8 @@ object TrackHub {
         val fetched = try {
             Tasks.await(AppSet.getClient(context).appSetIdInfo, 2, TimeUnit.SECONDS).id
         } catch (_: Exception) {
+            null
+        } catch (_: LinkageError) {
             null
         }
         val value = fetched?.takeIf(::isUuid) ?: return null
@@ -1546,7 +1637,7 @@ object TrackHub {
             .put("build", Build.ID ?: "")
         appVersion(context)?.let { body.put("app_version", it) }
         explicitCountryCode(prefs)?.let { body.put("country", it) }
-        if (collectAdvertisingId && prefs.getBoolean(AD_USER_DATA_KEY, false)) {
+        if (advertisingIdCollectionEnabled()) {
             val advertisingId = prefs.getString(ADVERTISING_ID_KEY, null)?.takeIf { it.isNotBlank() }
             if (advertisingId != null) {
                 body.put("device_id", advertisingId)

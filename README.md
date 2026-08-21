@@ -5,7 +5,7 @@ The Daively SDK provides first-party mobile measurement for installations,
 bounded purchase context. It does not depend on Apphud, RevenueCat or another
 billing SDK.
 
-Current release: `3.0.3` · Requirements: Android API 26+, Java/JVM 17
+Current release: `3.0.4` · Requirements: Android API 26+, Java/JVM 17
 
 ## Installation
 
@@ -13,7 +13,7 @@ Current release: `3.0.3` · Requirements: Android API 26+, Java/JVM 17
 repositories { maven("https://jitpack.io") }
 
 dependencies {
-    implementation("com.github.Alexander-kuksa:trackhub-android:3.0.3")
+    implementation("com.github.Alexander-kuksa:trackhub-android:3.0.4")
 }
 ```
 
@@ -60,10 +60,12 @@ identity. Daively does not call another billing SDK on the application's behalf.
 
 ## Privacy and consent
 
-Google Advertising ID and App Set ID support is optional and disabled by
-default. Applications that enable it must add the required Google runtime and
-permission, obtain the required consent, and keep their Google Play Data safety
-answers aligned with the destinations configured in Daively.
+Google Advertising ID and App Set ID support is controlled by an Owner-only,
+per-app switch in Daively and is disabled there by default. Version 3.0.4 ships
+the required Google runtime and permission so the switch can take effect
+without another app release. The SDK does not call either API while the switch
+is off. Applications must keep their consent flow, Google Play Data safety
+answers and destination disclosures aligned with how the switch is used.
 
 Consent is supplied by the host application's CMP or consent UI:
 

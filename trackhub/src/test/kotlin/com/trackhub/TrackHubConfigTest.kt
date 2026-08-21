@@ -8,6 +8,37 @@ import org.junit.Test
 
 class TrackHubConfigTest {
     @Test
+    fun advertisingIdHostCapabilityDefaultsOnForRemoteOwnerControl() {
+        assertTrue(TrackHubConfig("invalid-but-redacted-sdk-key").collectAdvertisingId)
+        assertFalse(TrackHub.shouldCollectAdvertisingId(true, false))
+        assertTrue(TrackHub.shouldCollectAdvertisingId(true, true))
+        assertFalse(TrackHub.shouldCollectAdvertisingId(false, true))
+    }
+
+    @Test
+    fun remoteAdvertisingIdConfigIsStrictAndFailsClosed() {
+        assertEquals(
+            true,
+            TrackHub.parseRemoteAdvertisingIdCollectionEnabled(
+                "{\"androidAdvertisingIdCollectionEnabled\":true}",
+            ),
+        )
+        assertEquals(
+            false,
+            TrackHub.parseRemoteAdvertisingIdCollectionEnabled(
+                "{\"androidAdvertisingIdCollectionEnabled\":false}",
+            ),
+        )
+        assertNull(TrackHub.parseRemoteAdvertisingIdCollectionEnabled("{}"))
+        assertNull(
+            TrackHub.parseRemoteAdvertisingIdCollectionEnabled(
+                "{\"androidAdvertisingIdCollectionEnabled\":\"true\"}",
+            ),
+        )
+        assertNull(TrackHub.parseRemoteAdvertisingIdCollectionEnabled("not-json"))
+    }
+
+    @Test
     fun googleAdsConsentIsOptionalAndDoesNotInferEitherSignal() {
         val consent = TrackHubGoogleAdsConsent()
 

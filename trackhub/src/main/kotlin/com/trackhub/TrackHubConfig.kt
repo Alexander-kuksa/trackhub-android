@@ -49,7 +49,9 @@ data class TrackHubConfig(
     val environment: TrackHubEnvironment = TrackHubEnvironment.Production,
     val debugLogging: Boolean = false,
     val countryCode: String? = null,
-    val collectAdvertisingId: Boolean = false,
+    // Local emergency opt-out. The owner-only Daively remote flag remains the
+    // authoritative enable switch and defaults to off for every app.
+    val collectAdvertisingId: Boolean = true,
     val firebaseAppInstanceId: String? = null,
     val googleAdsConsent: TrackHubGoogleAdsConsent = TrackHubGoogleAdsConsent(),
     val piplConsent: TrackHubPiplConsent = TrackHubPiplConsent(),
