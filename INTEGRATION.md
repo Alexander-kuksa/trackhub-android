@@ -9,6 +9,12 @@ report may use it. Commit failure opens the process-local storage circuit, so a
 hard kill cannot turn an acknowledged installation into a second identity on
 the next launch.
 
+Version 3.0.6 applies the same synchronous boundary to `first_open_at_ms`,
+including migration of the existing 3.0.0–3.0.5 preference. A hard kill after
+delivery can no longer regenerate Google's `first_open_at`. Commit failure
+opens the same process-local storage circuit and stops measurement without
+blocking or crashing the host application; the next launch retries.
+
 ```kotlin
 TrackHub.start(applicationContext, TrackHubConfig(sdkKey = trackHubSdkKey))
 TrackHub.setExternalIdentity("apphud", Apphud.userId())

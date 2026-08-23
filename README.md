@@ -5,7 +5,7 @@ The Daively SDK provides first-party mobile measurement for installations,
 bounded purchase context. It does not depend on Apphud, RevenueCat or another
 billing SDK.
 
-Current release: `3.0.5` · Requirements: Android API 26+, Java/JVM 17
+Current release: `3.0.6` · Requirements: Android API 26+, Java/JVM 17
 
 ## Installation
 
@@ -13,7 +13,7 @@ Current release: `3.0.5` · Requirements: Android API 26+, Java/JVM 17
 repositories { maven("https://jitpack.io") }
 
 dependencies {
-    implementation("com.github.Alexander-kuksa:trackhub-android:3.0.5")
+    implementation("com.github.Alexander-kuksa:trackhub-android:3.0.6")
 }
 ```
 
@@ -28,7 +28,10 @@ TrackHub.start(
 
 The SDK key is a credential. Do not log it or include it in URLs, analytics or
 crash reports. Startup, disk access and delivery are asynchronous and do not
-need to gate the application's UI.
+need to gate the application's UI. Version 3.0.6 synchronously commits both
+the installation ID and Google first-open timestamp before either can enter a
+report. A storage failure disables measurement for that process without
+blocking or crashing the host; the next launch retries.
 
 ## Events and attribution
 

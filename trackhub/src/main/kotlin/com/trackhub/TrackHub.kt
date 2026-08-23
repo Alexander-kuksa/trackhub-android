@@ -95,7 +95,7 @@ enum class TrackHubSalesEvent(val value: String) {
 object TrackHub {
 
     /** SDK version reported to the platform for integration detection. */
-    const val SDK_VERSION = "3.0.5"
+    const val SDK_VERSION = "3.0.6"
 
     private const val PREFS = "trackhub"
     private const val INSTALL_SENT_KEY = "install_sent"
@@ -177,6 +177,7 @@ object TrackHub {
     private val privacyCallbackLock = Any()
     private val identityStateLock = Any()
     private var volatileInstallUid: String? = null
+    private var volatileFirstOpenAtMs: Long? = null
 
     @Volatile private var endpoint: String? = null
     @Volatile private var ingestToken: String? = null
@@ -963,6 +964,7 @@ object TrackHub {
             volatileInstallUid = if (keepInstallCredential) {
                 prefs.getString(INSTALL_UID_KEY, null)?.takeIf { it.isNotBlank() }
             } else null
+            volatileFirstOpenAtMs = null
         }
         pendingGclid = null
         pendingGbraid = null
@@ -2255,6 +2257,12 @@ object TrackHub {
         volatileInstallUid = null
     }
 
+    internal fun firstOpenAtForTest(context: Context): Date = firstOpenAt(context.applicationContext)
+
+    internal fun resetVolatileFirstOpenAtForTest() = synchronized(identityStateLock) {
+        volatileFirstOpenAtMs = null
+    }
+
     private fun withIntegrationTestToken(rawBody: String): String {
         val token = integrationTestToken ?: return rawBody
         return runCatchingException { JSONObject(rawBody).put("test_run_token", token).toString() }
@@ -2382,13 +2390,36 @@ object TrackHub {
         context.packageManager.getPackageInfo(context.packageName, 0).versionName
     }.getOrNull()
 
+    internal data class FirstOpenResolution(
+        val valueMs: Long,
+        val durable: Boolean,
+    )
+
+    internal fun resolveFirstOpenAtValue(
+        storedMs: Long,
+        volatileMs: Long?,
+        nowMs: Long,
+        persist: (Long) -> Boolean,
+    ): FirstOpenResolution {
+        if (storedMs > 0L) return FirstOpenResolution(storedMs, durable = true)
+        val candidate = volatileMs?.takeIf { it > 0L } ?: nowMs
+        return FirstOpenResolution(candidate, durable = persist(candidate))
+    }
+
     private fun firstOpenAt(context: Context): Date = synchronized(identityStateLock) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val stored = prefs.getLong(FIRST_OPEN_AT_KEY, 0L)
-        if (stored > 0L) return@synchronized Date(stored)
-        val now = System.currentTimeMillis()
-        prefs.edit().putLong(FIRST_OPEN_AT_KEY, now).apply()
-        Date(now)
+        val resolution = resolveFirstOpenAtValue(
+            storedMs = prefs.getLong(FIRST_OPEN_AT_KEY, 0L),
+            volatileMs = volatileFirstOpenAtMs,
+            nowMs = System.currentTimeMillis(),
+            persist = { prefs.edit().putLong(FIRST_OPEN_AT_KEY, it).commit() },
+        )
+        volatileFirstOpenAtMs = resolution.valueMs
+        if (!resolution.durable) {
+            openRuntimeCircuit(RuntimeCircuitReason.STORAGE, "first-open timestamp persistence failed")
+            log("first-open timestamp is not durable — measurement disabled for this process")
+        }
+        Date(resolution.valueMs)
     }
 
     private fun installUid(context: Context): String = synchronized(identityStateLock) {
