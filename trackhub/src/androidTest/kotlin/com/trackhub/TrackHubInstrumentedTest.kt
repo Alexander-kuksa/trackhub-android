@@ -43,6 +43,25 @@ class TrackHubInstrumentedTest {
     }
 
     @Test
+    fun firstOpenTimestampIsCommittedBeforeItCanBeUsed() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val prefs = context.getSharedPreferences("trackhub", Context.MODE_PRIVATE)
+        prefs.edit().remove("first_open_at_ms").commit()
+        TrackHub.resetRuntimeCircuitForTest()
+        TrackHub.resetVolatileFirstOpenAtForTest()
+
+        val created = TrackHub.firstOpenAtForTest(context).time
+        assertEquals(created, prefs.getLong("first_open_at_ms", 0L))
+        assertTrue(created > 0L)
+
+        // Simulate a process-level reread. The same value must come from the
+        // synchronously committed preference, not process memory.
+        TrackHub.resetVolatileFirstOpenAtForTest()
+        assertEquals(created, TrackHub.firstOpenAtForTest(context).time)
+        assertFalse(TrackHub.runtimeCircuitOpenForTest())
+    }
+
+    @Test
     fun signedTestLabPayloadRetriesOfflineWithRemoteAdvertisingIdControl() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val testToken = "test-run-token-with-enough-entropy-1234"
@@ -268,7 +287,8 @@ class TrackHubInstrumentedTest {
             waitUntil("privacy measurement cleanup") {
                 TrackHub.offlineQueuePathCount(context, outageToken, "sdk/track") == 0 &&
                     !prefs.contains("openai_oppref") &&
-                    !prefs.contains("pending_openai_oppref")
+                    !prefs.contains("pending_openai_oppref") &&
+                    !prefs.contains("first_open_at_ms")
             }
             assertFalse(
                 TrackHub.handleDeepLink(
