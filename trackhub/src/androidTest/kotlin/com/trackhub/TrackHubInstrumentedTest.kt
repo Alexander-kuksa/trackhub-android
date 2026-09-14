@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.SystemClock
+import android.os.Looper
 import android.util.Base64
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -22,6 +23,8 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.ConcurrentHashMap
 
 @RunWith(AndroidJUnit4::class)
 class TrackHubInstrumentedTest {
@@ -66,6 +69,11 @@ class TrackHubInstrumentedTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val testToken = "test-run-token-with-enough-entropy-1234"
         val prefs = context.getSharedPreferences("trackhub", Context.MODE_PRIVATE)
+        // Connected tests can reinstall the same APK without clearing app
+        // data. Remove only this test app's SDK files, including a privacy job
+        // retained by a failed previous run, before starting a fresh scenario.
+        context.noBackupFilesDir.listFiles()?.filter { it.name.startsWith("trackhub-") }
+            ?.forEach { it.delete() }
         TrackHub.clearOfflineQueueForTest(context, testToken)
         prefs.edit()
             .clear()
@@ -85,6 +93,16 @@ class TrackHubInstrumentedTest {
         val installObservedResolvedConfig = AtomicBoolean(false)
         val firstFailedTrackSeen = CountDownLatch(1)
         val recoveredTrackSeen = CountDownLatch(1)
+        val salesRequests = ConcurrentHashMap<String, JSONObject>()
+        val salesSeen = CountDownLatch(3)
+        val credentialsAttempts = AtomicInteger(0)
+        val credentialsNotifications = AtomicInteger(0)
+        val credentialsFailureSeen = CountDownLatch(1)
+        val credentialsFailure = AtomicReference<TrackHubDeliveryFailure?>()
+        val callbackOnMain = AtomicBoolean(false)
+        val correctedSignatureTime = AtomicReference<Long?>()
+        val credentialProbeToken = "credential-probe-ingest-token-with-enough-entropy"
+        val serverTimeMs = System.currentTimeMillis() + TimeUnit.HOURS.toMillis(1)
         val server = MockWebServer()
         server.dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
@@ -94,6 +112,15 @@ class TrackHubInstrumentedTest {
                     return MockResponse().setResponseCode(200).setBody(
                         "{\"androidAdvertisingIdCollectionEnabled\":false}",
                     )
+                }
+                if (request.path?.contains("/ingest/$credentialProbeToken/") == true) {
+                    if (credentialsAttempts.incrementAndGet() == 1) {
+                        return MockResponse().setResponseCode(401).setBody(
+                            JSONObject().put("error", "clock_skew").put("server_time_ms", serverTimeMs).toString(),
+                        )
+                    }
+                    correctedSignatureTime.set(request.getHeader("X-TrackHub-Timestamp")?.toLongOrNull())
+                    return MockResponse().setResponseCode(401).setBody("{}")
                 }
                 when {
                     request.path?.endsWith("/install") == true &&
@@ -115,6 +142,11 @@ class TrackHubInstrumentedTest {
                 // request into a 200 while the test still waits for a retry.
                 val shouldFailTrack = isTrack && !allowTrackRecovery.get()
                 if (isTrack) {
+                    val body = JSONObject(request.body.clone().readUtf8())
+                    val name = body.optString("event_name")
+                    if (name in setOf("ob_shown", "pw_shown", "purchase_cta_tapped") &&
+                        salesRequests.putIfAbsent(name, body) == null
+                    ) salesSeen.countDown()
                     if (!shouldFailTrack) {
                         recoveredTrackSeen.countDown()
                     } else if (firstFailedTrackRequest.compareAndSet(null, request)) {
@@ -173,12 +205,7 @@ class TrackHubInstrumentedTest {
             assertEquals("chatgpt-click-123", sessionBody.getString("oppref"))
             assertFalse(installBody.has("device_id"))
 
-            assertTrue(
-                TrackHub.handleDeepLink(
-                    context,
-                    Uri.parse("https://app.example/open?wbraid=web-to-app-MixedCase-123"),
-                ),
-            )
+            TrackHub.setGoogleClickIds(wbraid = "web-to-app-MixedCase-123")
             assertTrue("wbraid re-engagement session was not delivered", wbraidSessionSeen.await(30, TimeUnit.SECONDS))
             val wbraidBody = JSONObject(requireNotNull(wbraidSessionRequest.get()).body.readUtf8())
             assertEquals("web-to-app-MixedCase-123", wbraidBody.getString("wbraid"))
@@ -225,6 +252,51 @@ class TrackHubInstrumentedTest {
             waitUntil("offline queue recovery") {
                 TrackHub.offlineQueueCount(context, testToken) == 0
             }
+
+            TrackHub.trackOnboardingShown(
+                callbackParams = mapOf("placement_name" to "must-be-removed", "screen" to "welcome"),
+                partnerParams = mapOf("variant" to "A"),
+                deduplicationId = "onboarding-v1",
+            )
+            TrackHub.trackPaywallShown(TrackHubSalesPlacement.ONBOARDING)
+            TrackHub.trackPurchaseCtaTapped(TrackHubSalesPlacement.IN_APP)
+            assertTrue("sales helper events were not delivered", salesSeen.await(30, TimeUnit.SECONDS))
+            val onboarding = requireNotNull(salesRequests["ob_shown"])
+            assertFalse(onboarding.getJSONObject("callback_params").has("placement_name"))
+            assertEquals("welcome", onboarding.getJSONObject("callback_params").getString("screen"))
+            assertEquals("A", onboarding.getJSONObject("partner_params").getString("variant"))
+            assertEquals(
+                TrackHub.deduplicatedClientEventId(onboarding.getString("install_uid"), "ob_shown", "onboarding-v1"),
+                onboarding.getString("client_event_id"),
+            )
+            assertEquals("onboarding_placement", salesRequests["pw_shown"]!!.getJSONObject("callback_params").getString("placement_name"))
+            assertEquals("inapp_placement", salesRequests["purchase_cta_tapped"]!!.getJSONObject("callback_params").getString("placement_name"))
+            waitUntil("sales events acknowledged") { TrackHub.offlineQueueCount(context, testToken) == 0 }
+
+            // A recoverable signing-clock response must retry before notifying
+            // the host. Only the final rejection stops delivery, once, on main.
+            TrackHub.start(
+                context,
+                TrackHubConfig(
+                    sdkKey = sdkKey(endpoint, credentialProbeToken, "test-credential-probe-secret"),
+                    environment = TrackHubEnvironment.TestLab("credential-probe-test-token-with-enough-entropy"),
+                    deliveryFailureHandler = { failure ->
+                        credentialsNotifications.incrementAndGet()
+                        credentialsFailure.set(failure)
+                        callbackOnMain.set(Looper.myLooper() == Looper.getMainLooper())
+                        credentialsFailureSeen.countDown()
+                    },
+                ),
+            )
+            assertTrue("credential failure was not reported", credentialsFailureSeen.await(30, TimeUnit.SECONDS))
+            assertEquals(2, credentialsAttempts.get())
+            assertEquals(1, credentialsNotifications.get())
+            assertTrue(credentialsFailure.get() is TrackHubDeliveryFailure.CredentialsRejected)
+            assertTrue(callbackOnMain.get())
+            assertTrue(requireNotNull(correctedSignatureTime.get()) >= serverTimeMs - 2_000)
+            assertTrue(TrackHub.runtimeCircuitOpenForTest())
+
+            TrackHub.resetRuntimeCircuitForTest() // simulate the next process with a fresh SDK Key
 
             val outageToken = "outage-resilience-token-with-enough-entropy-5678"
             val outageIngestToken = "test-ingest-token-with-enough-entropy-5678"
