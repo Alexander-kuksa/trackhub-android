@@ -95,7 +95,7 @@ enum class TrackHubSalesEvent(val value: String) {
 object TrackHub {
 
     /** SDK version reported to the platform for integration detection. */
-    const val SDK_VERSION = "3.0.6"
+    const val SDK_VERSION = "3.0.7"
 
     private const val PREFS = "trackhub"
     private const val INSTALL_SENT_KEY = "install_sent"
@@ -195,6 +195,8 @@ object TrackHub {
     @Volatile private var remoteAdvertisingIdCollectionEnabled = false
     @Volatile private var attributionChangedHandler: TrackHubAttributionChangedHandler? = null
     @Volatile private var deferredDeepLinkHandler: TrackHubDeferredDeepLinkHandler? = null
+    @Volatile private var deliveryFailureHandler: TrackHubDeliveryFailureHandler? = null
+    private var credentialsFailureSignaled = false
     @Volatile private var currentAttribution: TrackHubAttribution? = null
     @Volatile private var attributionFetchInFlight = false
     @Volatile private var deferredResolveInFlight = false
@@ -285,6 +287,7 @@ object TrackHub {
         this.collectAdvertisingId = configuration.collectAdvertisingId
         this.attributionChangedHandler = configuration.attributionChangedHandler
         this.deferredDeepLinkHandler = configuration.deferredDeepLinkHandler
+        this.deliveryFailureHandler = configuration.deliveryFailureHandler
         this.debug = configuration.debugLogging
         this.appContext = configuredAppContext
         migrateLegacyPrivacyState(configuredAppContext)
@@ -664,15 +667,75 @@ object TrackHub {
         deduplicationId: String? = null,
     ) {
         if (runtimeCircuitOpen.get()) return
-        val needsPlacement = event != TrackHubSalesEvent.ONBOARDING_SHOWN
-        if (needsPlacement && placement == null) {
+        val payload = salesEventPayload(event, placement, callbackParams)
+        if (payload == null) {
             log("${event.value} requires a canonical placement — skipped")
             return
         }
+        trackEvent(payload.first, payload.second, partnerParams, deduplicationId)
+    }
+
+    internal fun salesEventPayload(
+        event: TrackHubSalesEvent,
+        placement: TrackHubSalesPlacement?,
+        callbackParams: Map<String, *> = emptyMap<String, Any>(),
+    ): Pair<String, Map<String, Any?>>? {
+        if (event != TrackHubSalesEvent.ONBOARDING_SHOWN && placement == null) return null
         val canonical = runCatchingException { callbackParams.toMutableMap() }.getOrNull()
-            ?: return log("sales event parameters could not be copied — skipped")
-        if (placement != null) canonical["placement_name"] = placement.value
-        trackEvent(event.value, canonical, partnerParams, deduplicationId)
+            ?: return null
+        canonical.remove("placement_name")
+        if (event != TrackHubSalesEvent.ONBOARDING_SHOWN && placement != null) {
+            canonical["placement_name"] = placement.value
+        }
+        return event.value to canonical
+    }
+
+    @JvmStatic
+    @JvmOverloads
+    fun trackOnboardingShown(
+        callbackParams: Map<String, *> = emptyMap<String, Any>(),
+        partnerParams: Map<String, *> = emptyMap<String, Any>(),
+        deduplicationId: String? = null,
+    ) = trackSalesEvent(
+        TrackHubSalesEvent.ONBOARDING_SHOWN, null, callbackParams, partnerParams, deduplicationId,
+    )
+
+    @JvmStatic
+    @JvmOverloads
+    fun trackPaywallShown(
+        placement: TrackHubSalesPlacement,
+        callbackParams: Map<String, *> = emptyMap<String, Any>(),
+        partnerParams: Map<String, *> = emptyMap<String, Any>(),
+        deduplicationId: String? = null,
+    ) = trackSalesEvent(
+        TrackHubSalesEvent.PAYWALL_SHOWN, placement, callbackParams, partnerParams, deduplicationId,
+    )
+
+    @JvmStatic
+    @JvmOverloads
+    fun trackPurchaseCtaTapped(
+        placement: TrackHubSalesPlacement,
+        callbackParams: Map<String, *> = emptyMap<String, Any>(),
+        partnerParams: Map<String, *> = emptyMap<String, Any>(),
+        deduplicationId: String? = null,
+    ) = trackSalesEvent(
+        TrackHubSalesEvent.PURCHASE_CTA_TAPPED, placement, callbackParams, partnerParams, deduplicationId,
+    )
+
+    /** Google click IDs captured by a host link handler; delivered with one forced session. */
+    @JvmStatic
+    @JvmOverloads
+    fun setGoogleClickIds(gclid: String? = null, gbraid: String? = null, wbraid: String? = null) {
+        if (runtimeCircuitOpen.get() || privacyStopRequested.get()) return
+        captureClickReferences(
+            appContext,
+            DeepLinkReferences(
+                gclid?.takeIf { it.isNotEmpty() },
+                gbraid?.takeIf { it.isNotEmpty() },
+                wbraid?.takeIf { it.isNotEmpty() },
+                null,
+            ),
+        )
     }
 
     /**
@@ -739,6 +802,11 @@ object TrackHub {
             log("unsupported deep link — skipped")
             return false
         }
+        return captureClickReferences(context, parameters)
+    }
+
+    private fun captureClickReferences(context: Context?, parameters: DeepLinkReferences): Boolean {
+        if (trackingDisabled || privacyStopRequested.get() || runtimeCircuitOpen.get()) return false
         val (gclid, gbraid, wbraid, oppref) = parameters
         if (gclid == null && gbraid == null && wbraid == null && oppref == null) return false
         pendingGclid = gclid
@@ -2136,14 +2204,20 @@ object TrackHub {
             return
         }
 
+        if (code == 401 && !credentialsFailureSignaled) {
+            credentialsFailureSignaled = true
+            openRuntimeCircuit(RuntimeCircuitReason.CREDENTIALS, "SDK credentials rejected")
+            deliveryFailureHandler?.let { handler ->
+                val failure = TrackHubDeliveryFailure.CredentialsRejected(pending.path)
+                runHostCallbackOnMain { handler(failure) }
+            }
+        }
+
         items.remove(index)
         if (!persistPending(context, queueKey, items)) {
             log("${pending.path} delivery state could not be persisted")
             openRuntimeCircuit(RuntimeCircuitReason.STORAGE, "offline delivery state persistence")
             return
-        }
-        if (code == 401) {
-            openRuntimeCircuit(RuntimeCircuitReason.CREDENTIALS, "SDK credentials rejected")
         }
         if (code in 200..299) {
             when (pending.kind) {
@@ -2676,6 +2750,7 @@ object TrackHub {
 
     internal fun resetRuntimeCircuitForTest() {
         runtimeCircuitOpen.set(false)
+        credentialsFailureSignaled = false
         appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             ?.edit()
             ?.remove(RUNTIME_CIRCUIT_MARKER_KEY)

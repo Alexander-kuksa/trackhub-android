@@ -39,6 +39,13 @@ data class TrackHubPiplConsent(
     val adsMeasurement: TrackHubConsentStatus = TrackHubConsentStatus.UNKNOWN,
 )
 
+sealed class TrackHubDeliveryFailure {
+    /** Final credential rejection after clock-skew recovery; ship the current SDK Key. */
+    data class CredentialsRejected(val path: String) : TrackHubDeliveryFailure()
+}
+
+typealias TrackHubDeliveryFailureHandler = (TrackHubDeliveryFailure) -> Unit
+
 /**
  * The complete public TrackHub 3.0 startup configuration. `sdkKey` is copied
  * from TrackHub and contains the app-specific endpoint and ingest credentials.
@@ -57,6 +64,7 @@ data class TrackHubConfig(
     val piplConsent: TrackHubPiplConsent = TrackHubPiplConsent(),
     val attributionChangedHandler: TrackHubAttributionChangedHandler? = null,
     val deferredDeepLinkHandler: TrackHubDeferredDeepLinkHandler? = null,
+    val deliveryFailureHandler: TrackHubDeliveryFailureHandler? = null,
 ) {
     // Kotlin data classes include every constructor value in their generated
     // toString(). sdkKey carries signing credentials, so never expose it to
@@ -74,7 +82,8 @@ data class TrackHubConfig(
         "googleAdsConsent=$googleAdsConsent, " +
         "piplConsent=$piplConsent, " +
         "attributionChangedHandler=${attributionChangedHandler != null}, " +
-        "deferredDeepLinkHandler=${deferredDeepLinkHandler != null})"
+        "deferredDeepLinkHandler=${deferredDeepLinkHandler != null}, " +
+        "deliveryFailureHandler=${deliveryFailureHandler != null})"
 }
 
 internal data class DecodedTrackHubSdkKey(

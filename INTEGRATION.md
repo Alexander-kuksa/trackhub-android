@@ -1,5 +1,50 @@
 # TrackHub Android 3.0 integration reference
 
+## Android 3.0.7
+
+This release adds the shared APIs already available on iOS. With JitPack in
+your repositories, use `com.github.Alexander-kuksa:trackhub-android:3.0.7`.
+
+```kotlin
+TrackHub.trackOnboardingShown(deduplicationId = "onboarding-v1")
+TrackHub.trackPaywallShown(TrackHubSalesPlacement.ONBOARDING)
+TrackHub.trackPurchaseCtaTapped(TrackHubSalesPlacement.IN_APP)
+TrackHub.setGoogleClickIds(gclid = capturedGclid)
+```
+
+The sales helpers use `ob_shown`, `pw_shown`, and `purchase_cta_tapped`.
+They accept callback/partner parameters and optional deduplication IDs. Like
+iOS, onboarding removes `placement_name`; paywall/purchase intent always uses
+the typed placement. These are non-financial events, not confirmed purchases.
+`setGoogleClickIds` accepts optional `gclid`, `gbraid`, and `wbraid`, preserves
+case, and passes them once with the forced session. Prefer `handleDeepLink`
+when the incoming URI is available, especially for OpenAI `oppref`.
+
+An optional `TrackHubConfig.deliveryFailureHandler` receives
+`TrackHubDeliveryFailure.CredentialsRejected(path)` on the main thread once
+per process after a final HTTP 401. A recoverable clock-skew response retries
+first without notifying the host. The callback includes no key, token, user
+identifier, or response body. Measurement stops until the next process;
+`gdprForgetMe` remains available. Host callback failures remain host-owned.
+
+For a ChatGPT Ads acquisition, use the app's TrackHub measurement link as the
+ad destination. The updated platform redirect carries the raw `oppref` into
+Google Play's `referrer`; the SDK already forwards Install Referrer in the
+signed install report. Forward warm/cold app links using
+`TrackHub.handleDeepLink(context, uri)` too. Link exactly one ChatGPT Ads
+connection with its Pixel ID and server-only CAPI key. Trials and purchases
+need the configured billing source and explicit provider identity binding.
+Verify a real Play installation before treating attribution as live.
+
+Firebase can stay installed. Choose Hybrid in TrackHub if Firebase should
+supply product events while TrackHub owns installs/sessions/attribution;
+avoid reporting the same product event from both sources. Apple ATT,
+SKAdNetwork/AdAttributionKit and iOS ODM are platform-specific and are not
+Android APIs. Android uses Play Install Referrer and its existing remote
+advertising-ID collection setting.
+
+## SDK 3 identity and billing
+
 SDK 3 uses its durable `install_uid` as the internal measurement `user_id`.
 Billing identities are optional provider-scoped bindings and never rename the
 installation.
