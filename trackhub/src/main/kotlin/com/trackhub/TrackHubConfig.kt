@@ -39,6 +39,13 @@ data class TrackHubPiplConsent(
     val adsMeasurement: TrackHubConsentStatus = TrackHubConsentStatus.UNKNOWN,
 )
 
+/** Separate OpenAI destination decisions; never derived from Google or ATT. */
+data class TrackHubOpenAiAdsConsent(
+    val measurement: TrackHubConsentStatus = TrackHubConsentStatus.UNKNOWN,
+    val userData: TrackHubConsentStatus = TrackHubConsentStatus.UNKNOWN,
+    val personalization: TrackHubConsentStatus = TrackHubConsentStatus.UNKNOWN,
+)
+
 sealed class TrackHubDeliveryFailure {
     /** Final credential rejection after clock-skew recovery; ship the current SDK Key. */
     data class CredentialsRejected(val path: String) : TrackHubDeliveryFailure()
@@ -62,6 +69,7 @@ data class TrackHubConfig(
     val firebaseAppInstanceId: String? = null,
     val googleAdsConsent: TrackHubGoogleAdsConsent = TrackHubGoogleAdsConsent(),
     val piplConsent: TrackHubPiplConsent = TrackHubPiplConsent(),
+    val openAiAdsConsent: TrackHubOpenAiAdsConsent = TrackHubOpenAiAdsConsent(),
     val attributionChangedHandler: TrackHubAttributionChangedHandler? = null,
     val deferredDeepLinkHandler: TrackHubDeferredDeepLinkHandler? = null,
     val deliveryFailureHandler: TrackHubDeliveryFailureHandler? = null,

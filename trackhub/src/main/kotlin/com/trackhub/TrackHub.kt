@@ -95,7 +95,7 @@ enum class TrackHubSalesEvent(val value: String) {
 object TrackHub {
 
     /** SDK version reported to the platform for integration detection. */
-    const val SDK_VERSION = "3.0.7"
+    const val SDK_VERSION = "3.0.8"
 
     private const val PREFS = "trackhub"
     private const val INSTALL_SENT_KEY = "install_sent"
@@ -141,6 +141,10 @@ object TrackHub {
     private const val AD_PERSONALIZATION_KEY = "consent_ad_personalization"
     private const val EEA_KEY = "consent_eea"
     private const val PIPL_CONSENT_KEY = "consent_pipl"
+    private const val OPENAI_MEASUREMENT_KEY = "consent_openai_measurement"
+    private const val OPENAI_USER_DATA_KEY = "consent_openai_user_data"
+    private const val OPENAI_PERSONALIZATION_KEY = "consent_openai_personalization"
+    private const val OPENAI_CONSENT_REVISION_KEY = "consent_openai_revision"
     private const val CROSS_BORDER_TRANSFER_CONSENT_KEY = "consent_cross_border_transfer"
     private const val ADS_MEASUREMENT_CONSENT_KEY = "consent_ads_measurement"
     private const val REMOTE_AD_ID_CONFIG_KEY = "androidAdvertisingIdCollectionEnabled"
@@ -325,6 +329,7 @@ object TrackHub {
         normalizedCountryCode(configuration.countryCode)?.let { prefsEdit.putString(COUNTRY_CODE_KEY, it) }
         applyGoogleAdsConsent(prefsEdit, configuration.googleAdsConsent)
         applyPiplConsent(prefsEdit, configuration.piplConsent)
+        applyOpenAiAdsConsent(prefs, prefsEdit, configuration.openAiAdsConsent, forceRevision = false)
         val hasPendingGoogleReference = pendingGclid != null || pendingGbraid != null || pendingWbraid != null
         if (pendingOpenAiOppref != null && !hasPendingGoogleReference) {
             prefsEdit
@@ -351,6 +356,11 @@ object TrackHub {
         reportRuntimeCircuitDiagnosticIfNeeded(configuredAppContext)
         runOnMain { registerLifecycle(configuredAppContext) }
         val waitingForInstallQueue = reportInstallIfNeeded(configuredAppContext)
+        // An existing credential skips initial install. Still forward the current
+        // startup consent snapshot without creating another production first_open.
+        if (integrationTestToken == null && prefs.getBoolean(INSTALL_SENT_KEY, false)) {
+            sendConsentUpdate(configuredAppContext)
+        }
         syncPersistedExternalIdentities(configuredAppContext)
         reportPushTokenIfAvailable(configuredAppContext)
         if (!waitingForInstallQueue) {
@@ -459,6 +469,47 @@ object TrackHub {
             applyPiplConsent(prefs.edit(), consent).apply()
             if (prefs.getBoolean(INSTALL_SENT_KEY, false)) sendConsentUpdate(configured)
         }
+    }
+
+    /** Full OpenAI-only snapshot; UNKNOWN revokes a previous grant. */
+    @JvmStatic
+    fun updateOpenAiAdsConsent(consent: TrackHubOpenAiAdsConsent) {
+        if (runtimeCircuitOpen.get()) return
+        io.execute {
+            val configured = appContext ?: return@execute
+            if (trackingDisabled || hasPersistedPrivacyDisable(configured)) return@execute
+            val prefs = configured.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            applyOpenAiAdsConsent(prefs, prefs.edit(), consent).apply()
+            if (prefs.getBoolean(INSTALL_SENT_KEY, false)) sendConsentUpdate(configured)
+        }
+    }
+
+    private fun applyOpenAiAdsConsent(
+        prefs: android.content.SharedPreferences,
+        edit: android.content.SharedPreferences.Editor,
+        consent: TrackHubOpenAiAdsConsent,
+        forceRevision: Boolean = true,
+    ): android.content.SharedPreferences.Editor {
+        val fields = listOf(
+            OPENAI_MEASUREMENT_KEY to consent.measurement,
+            OPENAI_USER_DATA_KEY to consent.userData,
+            OPENAI_PERSONALIZATION_KEY to consent.personalization,
+        )
+        val changed = fields.any { (key, status) ->
+            val previous = if (prefs.contains(key)) prefs.getBoolean(key, false) else null
+            previous != status.booleanValue()
+        }
+        fields.forEach { (key, status) ->
+            status.booleanValue()?.let { edit.putBoolean(key, it) } ?: edit.remove(key)
+        }
+        val previous = prefs.getInt(OPENAI_CONSENT_REVISION_KEY, 0).coerceAtLeast(0)
+        val revision = when {
+            previous == 0 -> 1
+            forceRevision || changed -> (previous.toLong() + 1).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            else -> previous
+        }
+        edit.putInt(OPENAI_CONSENT_REVISION_KEY, revision)
+        return edit
     }
 
     private fun applyGoogleAdsConsent(
@@ -1017,6 +1068,10 @@ object TrackHub {
             .remove(PIPL_CONSENT_KEY)
             .remove(CROSS_BORDER_TRANSFER_CONSENT_KEY)
             .remove(ADS_MEASUREMENT_CONSENT_KEY)
+            .remove(OPENAI_MEASUREMENT_KEY)
+            .remove(OPENAI_USER_DATA_KEY)
+            .remove(OPENAI_PERSONALIZATION_KEY)
+            .remove(OPENAI_CONSENT_REVISION_KEY)
             .remove(EXTERNAL_IDENTITIES_KEY)
             .remove(EXTERNAL_IDENTITY_ACK_KEY)
         prefs.all.keys.filter {
@@ -1426,6 +1481,14 @@ object TrackHub {
     }
 
     private fun appendConsent(prefs: android.content.SharedPreferences, body: JSONObject) {
+        listOf(
+            "openai_ads_measurement_consent" to OPENAI_MEASUREMENT_KEY,
+            "openai_ads_user_data_consent" to OPENAI_USER_DATA_KEY,
+            "openai_ads_personalization_consent" to OPENAI_PERSONALIZATION_KEY,
+        ).forEach { (field, key) ->
+            body.put(field, if (prefs.contains(key)) prefs.getBoolean(key, false) else JSONObject.NULL)
+        }
+        body.put("openai_ads_consent_revision", prefs.getInt(OPENAI_CONSENT_REVISION_KEY, 1).coerceAtLeast(1))
         if (prefs.contains(AD_USER_DATA_KEY)) body.put("ad_user_data", prefs.getBoolean(AD_USER_DATA_KEY, false))
         if (prefs.contains(AD_PERSONALIZATION_KEY)) body.put("ad_personalization", prefs.getBoolean(AD_PERSONALIZATION_KEY, false))
         if (prefs.contains(EEA_KEY)) body.put("eea", prefs.getBoolean(EEA_KEY, false))
