@@ -2,8 +2,8 @@
 
 ## Android 3.0.8
 
-Adds independent OpenAI destination consent. Use
-`com.github.Alexander-kuksa:trackhub-android:3.0.8` after publication. Configure
+Adds independent OpenAI destination consent. With JitPack in your repositories,
+use `com.github.Alexander-kuksa:trackhub-android:3.0.8`. Configure
 `TrackHubConfig.openAiAdsConsent` with actual host/CMP decisions:
 
 ```kotlin
