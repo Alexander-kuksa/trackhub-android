@@ -403,7 +403,7 @@ object TrackHub {
             val context = appContext ?: return@execute
             val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             val desired = runCatchingException {
-                JSONObject(prefs.getString(EXTERNAL_IDENTITIES_KEY, "{}") ?: "{}")
+                boundedJsonObject(prefs.getString(EXTERNAL_IDENTITIES_KEY, "{}") ?: "{}")
             }.getOrDefault(JSONObject())
             desired.put(namespace, value ?: "")
             prefs.edit().putString(EXTERNAL_IDENTITIES_KEY, desired.toString()).apply()
@@ -669,9 +669,9 @@ object TrackHub {
         ) {
             return log("trackEvent deduplicationId exceeds 256 UTF-8 bytes — skipped")
         }
-        val callbackSnapshot = runCatchingException { callbackParams.toMap() }.getOrNull()
+        val callbackSnapshot = EventParameterSnapshot.copy(callbackParams)
             ?: return log("trackEvent callbackParams could not be copied — skipped")
-        val partnerSnapshot = runCatchingException { partnerParams.toMap() }.getOrNull()
+        val partnerSnapshot = EventParameterSnapshot.copy(partnerParams)
             ?: return log("trackEvent partnerParams could not be copied — skipped")
         if (privacyStopRequested.get()) return
         // start() is queued on the same serial executor. An event called
@@ -732,7 +732,7 @@ object TrackHub {
         callbackParams: Map<String, *> = emptyMap<String, Any>(),
     ): Pair<String, Map<String, Any?>>? {
         if (event != TrackHubSalesEvent.ONBOARDING_SHOWN && placement == null) return null
-        val canonical = runCatchingException { callbackParams.toMutableMap() }.getOrNull()
+        val canonical = EventParameterSnapshot.copy(callbackParams)?.toMutableMap()
             ?: return null
         canonical.remove("placement_name")
         if (event != TrackHubSalesEvent.ONBOARDING_SHOWN && placement != null) {
@@ -958,8 +958,8 @@ object TrackHub {
         }.orEmpty()
         for (file in fileCandidates) {
             val job = runCatchingException {
-                val raw = file.readText(Charsets.UTF_8)
-                if (raw.toByteArray(Charsets.UTF_8).size > 1024) null else JSONObject(raw)
+                val raw = file.inputStream().use { it.readBoundedUtf8(1024) } ?: return@runCatchingException null
+                if (!hasBoundedJsonStructure(raw, 1024)) null else boundedJsonObject(raw)
             }.getOrNull()?.takeIf {
                 isUuid(it.optString("install_uid")) && it.optString("reason").length <= 256
             } ?: continue
@@ -972,8 +972,8 @@ object TrackHub {
         for ((key, value) in prefs.all) {
             if (!key.startsWith(LEGACY_PENDING_ERASURE_PREFIX) || key == PENDING_ERASURE_KEY) continue
             val raw = value as? String ?: continue
-            if (raw.toByteArray(Charsets.UTF_8).size > 1024) continue
-            val job = runCatchingException { JSONObject(raw) }.getOrNull()?.takeIf {
+            if (!hasBoundedJsonStructure(raw, 1024) || raw.toByteArray(Charsets.UTF_8).size > 1024) continue
+            val job = runCatchingException { boundedJsonObject(raw) }.getOrNull()?.takeIf {
                 isUuid(it.optString("install_uid")) && it.optString("reason").length <= 256
             } ?: continue
             if (persistPendingErasure(context, job)) {
@@ -1010,10 +1010,10 @@ object TrackHub {
     private fun loadPendingErasure(context: Context): JSONObject? = synchronized(privacyStateLock) {
         val atomic = AtomicFile(pendingErasureFile(context))
         val fromFile = runCatchingException {
-            atomic.openRead().bufferedReader(Charsets.UTF_8).use { reader ->
-                val raw = reader.readText()
-                if (raw.toByteArray(Charsets.UTF_8).size > 1024) return@runCatchingException null
-                JSONObject(raw).takeIf {
+            atomic.openRead().use { input ->
+                val raw = input.readBoundedUtf8(1024) ?: return@runCatchingException null
+                if (!hasBoundedJsonStructure(raw, 1024)) return@runCatchingException null
+                boundedJsonObject(raw).takeIf {
                     isUuid(it.optString("install_uid")) && it.optString("reason").length <= 256
                 }
             }
@@ -1022,8 +1022,8 @@ object TrackHub {
         val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getString(PENDING_ERASURE_KEY, null)
             ?: return@synchronized null
-        if (raw.toByteArray(Charsets.UTF_8).size > 1024) return@synchronized null
-        runCatchingException { JSONObject(raw) }.getOrNull()?.takeIf {
+        if (!hasBoundedJsonStructure(raw, 1024) || raw.toByteArray(Charsets.UTF_8).size > 1024) return@synchronized null
+        runCatchingException { boundedJsonObject(raw) }.getOrNull()?.takeIf {
             isUuid(it.optString("install_uid")) && it.optString("reason").length <= 256
         }
     }
@@ -1311,7 +1311,7 @@ object TrackHub {
         runCatchingException {
             val body = raw?.takeIf { it.toByteArray(Charsets.UTF_8).size <= 4096 }
                 ?: return@runCatchingException null
-            val value = JSONObject(body).opt(REMOTE_AD_ID_CONFIG_KEY)
+            val value = boundedJsonObject(body).opt(REMOTE_AD_ID_CONFIG_KEY)
             value as? Boolean
         }.getOrNull()
 
@@ -1663,7 +1663,7 @@ object TrackHub {
     }
 
     private fun parseAttribution(raw: String): TrackHubAttribution? = runCatchingException {
-        val envelope = JSONObject(raw)
+        val envelope = boundedJsonObject(raw)
         if (!envelope.optBoolean("ok")) return@runCatchingException null
         val attribution = envelope.optJSONObject("attribution") ?: return@runCatchingException null
         if (attribution.optString("provider") != "custom") return@runCatchingException null
@@ -1695,7 +1695,7 @@ object TrackHub {
     private fun syncPersistedExternalIdentities(context: Context) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val desired = runCatchingException {
-            JSONObject(prefs.getString(EXTERNAL_IDENTITIES_KEY, "{}") ?: "{}")
+            boundedJsonObject(prefs.getString(EXTERNAL_IDENTITIES_KEY, "{}") ?: "{}")
         }.getOrDefault(JSONObject())
         val providers = desired.keys()
         while (providers.hasNext()) {
@@ -1719,7 +1719,7 @@ object TrackHub {
         }
         val fingerprint = externalIdentityFingerprint(provider, userId)
         val acknowledged = runCatchingException {
-            JSONObject(prefs.getString(EXTERNAL_IDENTITY_ACK_KEY, "{}") ?: "{}")
+            boundedJsonObject(prefs.getString(EXTERNAL_IDENTITY_ACK_KEY, "{}") ?: "{}")
         }.getOrDefault(JSONObject())
         if (acknowledged.optString(provider) == fingerprint) return
         val body = JSONObject()
@@ -1789,7 +1789,7 @@ object TrackHub {
                     return@state
                 }
                 val path = runCatchingException {
-                    JSONObject(raw).optString("deep_link_path").takeIf { it.isNotEmpty() }
+                    boundedJsonObject(raw).optString("deep_link_path").takeIf { it.isNotEmpty() }
                 }.getOrNull()
                 prefs.edit().putBoolean(key, true).remove(DEFERRED_MATCH_TOKEN_KEY).apply()
                 runHostCallbackOnMain { handler(path) }
@@ -2000,8 +2000,8 @@ object TrackHub {
             val legacyBackup = File(legacyFile.path + ".bak")
             if (legacyFile.exists() || legacyBackup.exists()) {
                 val migrated = runCatchingException {
-                    AtomicFile(legacyFile).openRead().bufferedReader(Charsets.UTF_8).use { reader ->
-                        decodePending(reader.readText())
+                    AtomicFile(legacyFile).openRead().use { input ->
+                        input.readBoundedUtf8(MAX_PENDING_BYTES * 2)?.let(::decodePending)
                     }
                 }.getOrNull()
                 if (migrated != null && persistPending(context, queueKey, migrated)) {
@@ -2036,17 +2036,7 @@ object TrackHub {
 
         val atomic = AtomicFile(file)
         val raw = runCatchingException {
-            atomic.openRead().use { input ->
-                val output = ByteArrayOutputStream()
-                val buffer = ByteArray(8192)
-                while (output.size() <= MAX_PENDING_BYTES * 2) {
-                    val read = input.read(buffer)
-                    if (read <= 0) break
-                    output.write(buffer, 0, read)
-                }
-                if (output.size() > MAX_PENDING_BYTES * 2) null
-                else output.toString(Charsets.UTF_8.name())
-            }
+            atomic.openRead().use { it.readBoundedUtf8(MAX_PENDING_BYTES * 2) }
         }.getOrNull()
         val decoded = raw?.let(::decodePending)
         if (decoded != null) return decoded
@@ -2078,8 +2068,8 @@ object TrackHub {
         if (candidateBases.isEmpty()) return
 
         fun readQueue(file: File): JSONArray? = runCatchingException {
-            AtomicFile(file).openRead().bufferedReader(Charsets.UTF_8).use { reader ->
-                decodePending(reader.readText())
+            AtomicFile(file).openRead().use { input ->
+                input.readBoundedUtf8(MAX_PENDING_BYTES * 2)?.let(::decodePending)
             }
         }.getOrNull()
 
@@ -2096,6 +2086,12 @@ object TrackHub {
                 val id = item.optString("id")
                 if (id.isEmpty() || ids.add(id)) merged.put(item)
             }
+            // Bound memory across many rotated namespaces, not only at the end.
+            trimPending(merged)
+            ids.clear()
+            for (index in 0 until merged.length()) {
+                merged.optJSONObject(index)?.optString("id")?.takeIf { it.isNotEmpty() }?.let(ids::add)
+            }
             migrated += candidate
         }
         if (migrated.isEmpty()) return
@@ -2109,7 +2105,8 @@ object TrackHub {
     }
 
     private fun decodePending(raw: String): JSONArray? {
-        if (raw.toByteArray(Charsets.UTF_8).size > MAX_PENDING_BYTES * 2) return null
+        if (!hasBoundedJsonStructure(raw, MAX_PENDING_BYTES * 2)
+            || raw.toByteArray(Charsets.UTF_8).size > MAX_PENDING_BYTES * 2) return null
         return runCatchingException { JSONArray(raw) }.getOrNull()
     }
 
@@ -2297,14 +2294,14 @@ object TrackHub {
                 "test_install" -> log("integration-test install reported")
                 "external_identity" -> {
                     runCatchingException {
-                        val body = JSONObject(pending.body)
+                        val body = boundedJsonObject(pending.body)
                         val provider = body.getString("provider")
                         val externalId = if (body.isNull("external_user_id")) {
                             null
                         } else {
                             body.getString("external_user_id")
                         }
-                        val acknowledged = JSONObject(
+                        val acknowledged = boundedJsonObject(
                             prefs.getString(EXTERNAL_IDENTITY_ACK_KEY, "{}") ?: "{}",
                         )
                         acknowledged.put(
@@ -2402,7 +2399,7 @@ object TrackHub {
 
     private fun withIntegrationTestToken(rawBody: String): String {
         val token = integrationTestToken ?: return rawBody
-        return runCatchingException { JSONObject(rawBody).put("test_run_token", token).toString() }
+        return runCatchingException { boundedJsonObject(rawBody).put("test_run_token", token).toString() }
             .getOrDefault(rawBody)
     }
 
@@ -2482,16 +2479,18 @@ object TrackHub {
             val output = ByteArrayOutputStream()
             val buffer = ByteArray(4096)
             val deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(MAX_RESPONSE_READ_MS)
-            while (output.size() < MAX_RESPONSE_BYTES) {
+            while (output.size() <= MAX_RESPONSE_BYTES) {
                 val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime())
-                if (remainingMs <= 0) break
+                if (remainingMs <= 0) return@use null
                 conn.readTimeout = min(10_000L, remainingMs).coerceAtLeast(1L).toInt()
-                val remaining = MAX_RESPONSE_BYTES - output.size()
+                val remaining = MAX_RESPONSE_BYTES + 1 - output.size()
                 val read = input.read(buffer, 0, min(buffer.size, remaining))
-                if (read <= 0) break
+                if (read < 0) break
+                if (read == 0) return@use null
                 output.write(buffer, 0, read)
             }
-            output.toString(Charsets.UTF_8.name())
+            if (output.size() > MAX_RESPONSE_BYTES) return@use null
+            output.toString(Charsets.UTF_8.name()).takeIf { hasBoundedJsonStructure(it, MAX_RESPONSE_BYTES) }
         }
     }
 
@@ -2510,7 +2509,7 @@ object TrackHub {
     }.getOrNull()
 
     private fun serverClockOffset(raw: String?, localTimeMs: Long): Long? = runCatchingException {
-        val json = JSONObject(raw ?: return@runCatchingException null)
+        val json = boundedJsonObject(raw ?: return@runCatchingException null)
         val serverTime = json.optLong("server_time_ms", 0L)
         val error = json.optString("error")
         serverClockOffset(error, serverTime, localTimeMs)
@@ -2665,7 +2664,7 @@ object TrackHub {
 
     private fun saveInstallCredential(context: Context, responseBody: String?) {
         val token = ingestToken ?: return
-        val json = runCatchingException { JSONObject(responseBody ?: return) }.getOrNull() ?: return
+        val json = runCatchingException { boundedJsonObject(responseBody ?: return) }.getOrNull() ?: return
         val credential = json.optString("install_token")
         val responseInstallUid = json.optString("install_uid")
         if (responseInstallUid != installUid(context)) return
@@ -2759,7 +2758,7 @@ object TrackHub {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val raw = prefs.getString(RUNTIME_CIRCUIT_MARKER_KEY, null) ?: return
         val marker = try {
-            JSONObject(raw)
+            boundedJsonObject(raw)
         } catch (_: Exception) {
             prefs.edit().remove(RUNTIME_CIRCUIT_MARKER_KEY).apply()
             return
