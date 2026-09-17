@@ -1,9 +1,52 @@
 # TrackHub Android 3.0 integration reference
 
-## Android 3.0.7
+## Android 3.0.9
 
-This release adds the shared APIs already available on iOS. With JitPack in
-your repositories, use `com.github.Alexander-kuksa:trackhub-android:3.0.7`.
+Includes first-install delivery ordering, durable late Firebase identity updates,
+shared Install Referrer readiness, and bounded payload/storage crash containment.
+Subsequent events wait in the durable queue until the initial install is queued;
+network retries preserve the original first-open timestamp.
+
+
+Adds independent OpenAI destination consent. With JitPack in your repositories,
+use `com.github.Alexander-kuksa:trackhub-android:3.0.9`. Configure
+`TrackHubConfig.openAiAdsConsent` with actual host/CMP decisions:
+
+```kotlin
+// First Activity, before the app's single TrackHub.start owner runs.
+// Forward the original URI; Application.onCreate has no launch intent.
+intent?.data?.let { TrackHub.handleDeepLink(applicationContext, it) }
+val openAiConsent = TrackHubOpenAiAdsConsent(
+    measurement = measurementDecision,
+    userData = userDataDecision,
+    personalization = personalizationDecision,
+)
+TrackHub.start(applicationContext, TrackHubConfig(
+    sdkKey = trackHubSdkKey,
+    openAiAdsConsent = openAiConsent,
+))
+// Call after a real CMP change, including withdrawal/unknown:
+TrackHub.updateOpenAiAdsConsent(updatedOpenAiConsent)
+```
+
+Each decision is `TrackHubConsentStatus.GRANTED`, `DENIED` or `UNKNOWN`.
+Unknown measurement is not permission to send. User-data and personalization
+decisions are independent; they never inherit Google consent or advertising-ID
+availability. Full snapshots carry an increasing revision, and erasure clears
+local values. The Google consent/identifier behavior is unchanged.
+
+Requires platform migration `0089_openai_destination_consent` and its delivery
+policy release before enabling ChatGPT Ads. That server release can recover a
+signed late Play referrer at the immutable original installation time (within
+the provider event window); a warm app link cannot manufacture an installation.
+Test a real Play install and CMP withdrawal. Build success or API acceptance is
+not proof of attribution in Ads reporting. Never put a CAPI key in the app.
+
+## APIs introduced in Android 3.0.7 (included in 3.0.9)
+
+These shared APIs are also available on iOS. Keep the current `3.0.9`
+dependency from the installation instructions above; this section documents
+when the APIs were introduced, not a separate version to install.
 
 ```kotlin
 TrackHub.trackOnboardingShown(deduplicationId = "onboarding-v1")

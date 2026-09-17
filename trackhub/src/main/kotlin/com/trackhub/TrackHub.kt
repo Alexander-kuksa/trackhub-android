@@ -95,11 +95,12 @@ enum class TrackHubSalesEvent(val value: String) {
 object TrackHub {
 
     /** SDK version reported to the platform for integration detection. */
-    const val SDK_VERSION = "3.0.7"
+    const val SDK_VERSION = "3.0.9"
 
     private const val PREFS = "trackhub"
     private const val INSTALL_SENT_KEY = "install_sent"
     private const val FIRST_OPEN_AT_KEY = "first_open_at_ms"
+    private const val FIREBASE_APP_INSTANCE_ID_KEY = "firebase_app_instance_id"
     private const val PENDING_REPORTS_KEY = "pending_reports"
     private const val SESSION_SEQ_KEY = "session_seq"
     private const val LAST_BACKGROUND_KEY = "last_background_ms"
@@ -141,6 +142,10 @@ object TrackHub {
     private const val AD_PERSONALIZATION_KEY = "consent_ad_personalization"
     private const val EEA_KEY = "consent_eea"
     private const val PIPL_CONSENT_KEY = "consent_pipl"
+    private const val OPENAI_MEASUREMENT_KEY = "consent_openai_measurement"
+    private const val OPENAI_USER_DATA_KEY = "consent_openai_user_data"
+    private const val OPENAI_PERSONALIZATION_KEY = "consent_openai_personalization"
+    private const val OPENAI_CONSENT_REVISION_KEY = "consent_openai_revision"
     private const val CROSS_BORDER_TRANSFER_CONSENT_KEY = "consent_cross_border_transfer"
     private const val ADS_MEASUREMENT_CONSENT_KEY = "consent_ads_measurement"
     private const val REMOTE_AD_ID_CONFIG_KEY = "androidAdvertisingIdCollectionEnabled"
@@ -208,6 +213,7 @@ object TrackHub {
     @Volatile private var pendingErasureCompletion: ((Boolean) -> Unit)? = null
     // Accessed only from `io`.
     private var deliveryInFlight = false
+    private var initialInstallPending = false
     private var retryGeneration = 0L
     private var retryScheduledAtMs = 0L
     private var transientRetryNotBeforeMs = 0L
@@ -320,11 +326,14 @@ object TrackHub {
         }
         privacyStopRequested.set(false)
         trackingDisabled = false
-        this.firebaseAppInstanceId = configuration.firebaseAppInstanceId?.takeIf { it.isNotBlank() }
+        this.firebaseAppInstanceId = normalizedFirebaseAppInstanceId(configuration.firebaseAppInstanceId)
+            ?: prefs.getString(FIREBASE_APP_INSTANCE_ID_KEY, null)
         val prefsEdit = prefs.edit()
+        this.firebaseAppInstanceId?.let { prefsEdit.putString(FIREBASE_APP_INSTANCE_ID_KEY, it) }
         normalizedCountryCode(configuration.countryCode)?.let { prefsEdit.putString(COUNTRY_CODE_KEY, it) }
         applyGoogleAdsConsent(prefsEdit, configuration.googleAdsConsent)
         applyPiplConsent(prefsEdit, configuration.piplConsent)
+        applyOpenAiAdsConsent(prefs, prefsEdit, configuration.openAiAdsConsent, forceRevision = false)
         val hasPendingGoogleReference = pendingGclid != null || pendingGbraid != null || pendingWbraid != null
         if (pendingOpenAiOppref != null && !hasPendingGoogleReference) {
             prefsEdit
@@ -351,6 +360,11 @@ object TrackHub {
         reportRuntimeCircuitDiagnosticIfNeeded(configuredAppContext)
         runOnMain { registerLifecycle(configuredAppContext) }
         val waitingForInstallQueue = reportInstallIfNeeded(configuredAppContext)
+        // An existing credential skips initial install. Still forward the current
+        // startup consent snapshot without creating another production first_open.
+        if (integrationTestToken == null && prefs.getBoolean(INSTALL_SENT_KEY, false)) {
+            sendConsentUpdate(configuredAppContext)
+        }
         syncPersistedExternalIdentities(configuredAppContext)
         reportPushTokenIfAvailable(configuredAppContext)
         if (!waitingForInstallQueue) {
@@ -374,10 +388,23 @@ object TrackHub {
      */
     @JvmStatic
     fun updateFirebaseAppInstanceId(appInstanceId: String) {
-        if (!privacyStopRequested.get() && !runtimeCircuitOpen.get() && appInstanceId.isNotEmpty()) {
-            firebaseAppInstanceId = appInstanceId
+        val value = normalizedFirebaseAppInstanceId(appInstanceId) ?: return
+        if (privacyStopRequested.get() || runtimeCircuitOpen.get()) return
+        io.execute {
+            if (trackingDisabled || privacyStopRequested.get() || runtimeCircuitOpen.get()) return@execute
+            val context = appContext ?: return@execute
+            val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            if (firebaseAppInstanceId == value && prefs.getString(FIREBASE_APP_INSTANCE_ID_KEY, null) == value) return@execute
+            firebaseAppInstanceId = value
+            prefs.edit().putString(FIREBASE_APP_INSTANCE_ID_KEY, value).apply()
+            if (integrationTestToken == null && prefs.getBoolean(INSTALL_SENT_KEY, false)) {
+                sendConsentUpdate(context)
+            }
         }
     }
+
+    internal fun normalizedFirebaseAppInstanceId(value: String?): String? =
+        value?.trim()?.takeIf { it.length in 1..64 }
 
     /**
      * Bind or clear an optional billing identity without importing that
@@ -393,7 +420,7 @@ object TrackHub {
             val context = appContext ?: return@execute
             val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             val desired = runCatchingException {
-                JSONObject(prefs.getString(EXTERNAL_IDENTITIES_KEY, "{}") ?: "{}")
+                boundedJsonObject(prefs.getString(EXTERNAL_IDENTITIES_KEY, "{}") ?: "{}")
             }.getOrDefault(JSONObject())
             desired.put(namespace, value ?: "")
             prefs.edit().putString(EXTERNAL_IDENTITIES_KEY, desired.toString()).apply()
@@ -459,6 +486,47 @@ object TrackHub {
             applyPiplConsent(prefs.edit(), consent).apply()
             if (prefs.getBoolean(INSTALL_SENT_KEY, false)) sendConsentUpdate(configured)
         }
+    }
+
+    /** Full OpenAI-only snapshot; UNKNOWN revokes a previous grant. */
+    @JvmStatic
+    fun updateOpenAiAdsConsent(consent: TrackHubOpenAiAdsConsent) {
+        if (runtimeCircuitOpen.get()) return
+        io.execute {
+            val configured = appContext ?: return@execute
+            if (trackingDisabled || hasPersistedPrivacyDisable(configured)) return@execute
+            val prefs = configured.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            applyOpenAiAdsConsent(prefs, prefs.edit(), consent).apply()
+            if (prefs.getBoolean(INSTALL_SENT_KEY, false)) sendConsentUpdate(configured)
+        }
+    }
+
+    private fun applyOpenAiAdsConsent(
+        prefs: android.content.SharedPreferences,
+        edit: android.content.SharedPreferences.Editor,
+        consent: TrackHubOpenAiAdsConsent,
+        forceRevision: Boolean = true,
+    ): android.content.SharedPreferences.Editor {
+        val fields = listOf(
+            OPENAI_MEASUREMENT_KEY to consent.measurement,
+            OPENAI_USER_DATA_KEY to consent.userData,
+            OPENAI_PERSONALIZATION_KEY to consent.personalization,
+        )
+        val changed = fields.any { (key, status) ->
+            val previous = if (prefs.contains(key)) prefs.getBoolean(key, false) else null
+            previous != status.booleanValue()
+        }
+        fields.forEach { (key, status) ->
+            status.booleanValue()?.let { edit.putBoolean(key, it) } ?: edit.remove(key)
+        }
+        val previous = prefs.getInt(OPENAI_CONSENT_REVISION_KEY, 0).coerceAtLeast(0)
+        val revision = when {
+            previous == 0 -> 1
+            forceRevision || changed -> (previous.toLong() + 1).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            else -> previous
+        }
+        edit.putInt(OPENAI_CONSENT_REVISION_KEY, revision)
+        return edit
     }
 
     private fun applyGoogleAdsConsent(
@@ -618,9 +686,9 @@ object TrackHub {
         ) {
             return log("trackEvent deduplicationId exceeds 256 UTF-8 bytes — skipped")
         }
-        val callbackSnapshot = runCatchingException { callbackParams.toMap() }.getOrNull()
+        val callbackSnapshot = EventParameterSnapshot.copy(callbackParams)
             ?: return log("trackEvent callbackParams could not be copied — skipped")
-        val partnerSnapshot = runCatchingException { partnerParams.toMap() }.getOrNull()
+        val partnerSnapshot = EventParameterSnapshot.copy(partnerParams)
             ?: return log("trackEvent partnerParams could not be copied — skipped")
         if (privacyStopRequested.get()) return
         // start() is queued on the same serial executor. An event called
@@ -681,7 +749,7 @@ object TrackHub {
         callbackParams: Map<String, *> = emptyMap<String, Any>(),
     ): Pair<String, Map<String, Any?>>? {
         if (event != TrackHubSalesEvent.ONBOARDING_SHOWN && placement == null) return null
-        val canonical = runCatchingException { callbackParams.toMutableMap() }.getOrNull()
+        val canonical = EventParameterSnapshot.copy(callbackParams)?.toMutableMap()
             ?: return null
         canonical.remove("placement_name")
         if (event != TrackHubSalesEvent.ONBOARDING_SHOWN && placement != null) {
@@ -907,8 +975,8 @@ object TrackHub {
         }.orEmpty()
         for (file in fileCandidates) {
             val job = runCatchingException {
-                val raw = file.readText(Charsets.UTF_8)
-                if (raw.toByteArray(Charsets.UTF_8).size > 1024) null else JSONObject(raw)
+                val raw = file.inputStream().use { it.readBoundedUtf8(1024) } ?: return@runCatchingException null
+                if (!hasBoundedJsonStructure(raw, 1024)) null else boundedJsonObject(raw)
             }.getOrNull()?.takeIf {
                 isUuid(it.optString("install_uid")) && it.optString("reason").length <= 256
             } ?: continue
@@ -921,8 +989,8 @@ object TrackHub {
         for ((key, value) in prefs.all) {
             if (!key.startsWith(LEGACY_PENDING_ERASURE_PREFIX) || key == PENDING_ERASURE_KEY) continue
             val raw = value as? String ?: continue
-            if (raw.toByteArray(Charsets.UTF_8).size > 1024) continue
-            val job = runCatchingException { JSONObject(raw) }.getOrNull()?.takeIf {
+            if (!hasBoundedJsonStructure(raw, 1024) || raw.toByteArray(Charsets.UTF_8).size > 1024) continue
+            val job = runCatchingException { boundedJsonObject(raw) }.getOrNull()?.takeIf {
                 isUuid(it.optString("install_uid")) && it.optString("reason").length <= 256
             } ?: continue
             if (persistPendingErasure(context, job)) {
@@ -959,10 +1027,10 @@ object TrackHub {
     private fun loadPendingErasure(context: Context): JSONObject? = synchronized(privacyStateLock) {
         val atomic = AtomicFile(pendingErasureFile(context))
         val fromFile = runCatchingException {
-            atomic.openRead().bufferedReader(Charsets.UTF_8).use { reader ->
-                val raw = reader.readText()
-                if (raw.toByteArray(Charsets.UTF_8).size > 1024) return@runCatchingException null
-                JSONObject(raw).takeIf {
+            atomic.openRead().use { input ->
+                val raw = input.readBoundedUtf8(1024) ?: return@runCatchingException null
+                if (!hasBoundedJsonStructure(raw, 1024)) return@runCatchingException null
+                boundedJsonObject(raw).takeIf {
                     isUuid(it.optString("install_uid")) && it.optString("reason").length <= 256
                 }
             }
@@ -971,8 +1039,8 @@ object TrackHub {
         val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getString(PENDING_ERASURE_KEY, null)
             ?: return@synchronized null
-        if (raw.toByteArray(Charsets.UTF_8).size > 1024) return@synchronized null
-        runCatchingException { JSONObject(raw) }.getOrNull()?.takeIf {
+        if (!hasBoundedJsonStructure(raw, 1024) || raw.toByteArray(Charsets.UTF_8).size > 1024) return@synchronized null
+        runCatchingException { boundedJsonObject(raw) }.getOrNull()?.takeIf {
             isUuid(it.optString("install_uid")) && it.optString("reason").length <= 256
         }
     }
@@ -1008,6 +1076,7 @@ object TrackHub {
             .remove(PENDING_OPENAI_OPPREF_KEY)
             .remove(DEFERRED_MATCH_TOKEN_KEY)
             .remove(FIRST_OPEN_AT_KEY)
+            .remove(FIREBASE_APP_INSTANCE_ID_KEY)
             .remove(SESSION_SEQ_KEY)
             .remove(LAST_BACKGROUND_KEY)
             .remove(COUNTRY_CODE_KEY)
@@ -1017,6 +1086,10 @@ object TrackHub {
             .remove(PIPL_CONSENT_KEY)
             .remove(CROSS_BORDER_TRANSFER_CONSENT_KEY)
             .remove(ADS_MEASUREMENT_CONSENT_KEY)
+            .remove(OPENAI_MEASUREMENT_KEY)
+            .remove(OPENAI_USER_DATA_KEY)
+            .remove(OPENAI_PERSONALIZATION_KEY)
+            .remove(OPENAI_CONSENT_REVISION_KEY)
             .remove(EXTERNAL_IDENTITIES_KEY)
             .remove(EXTERNAL_IDENTITY_ACK_KEY)
         prefs.all.keys.filter {
@@ -1256,7 +1329,7 @@ object TrackHub {
         runCatchingException {
             val body = raw?.takeIf { it.toByteArray(Charsets.UTF_8).size <= 4096 }
                 ?: return@runCatchingException null
-            val value = JSONObject(body).opt(REMOTE_AD_ID_CONFIG_KEY)
+            val value = boundedJsonObject(body).opt(REMOTE_AD_ID_CONFIG_KEY)
             value as? Boolean
         }.getOrNull()
 
@@ -1281,6 +1354,10 @@ object TrackHub {
 
     private fun reportInstallIfNeeded(context: Context): Boolean {
         if (trackingDisabled || runtimeCircuitOpen.get()) return false
+        // Attribution lookup and lifecycle callbacks may request bootstrap
+        // during start. Share the outstanding gate instead of opening another
+        // Play connection and dispatching a second delayed install callback.
+        if (initialInstallPending) return true
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val installUid = installUid(context)
         val installAlreadySent = prefs.getBoolean(INSTALL_SENT_KEY, false)
@@ -1297,9 +1374,12 @@ object TrackHub {
             return false
         }
 
-        val client = InstallReferrerClient.newBuilder(context).build()
+        initialInstallPending = true
         val readiness = InitialInstallReadinessGate(
-            onInitialReady = { referrer -> io.execute { sendInstall(context, prefs, referrer) } },
+            onInitialReady = { referrer -> io.execute {
+                initialInstallPending = false
+                sendInstall(context, prefs, referrer)
+            } },
             onLateReferrer = { referrer ->
                 // The bounded fallback may have fired first. Preserve a late
                 // Play response as an idempotent attribution signal for the
@@ -1324,6 +1404,7 @@ object TrackHub {
             TimeUnit.SECONDS,
             readiness::onTimeout,
         )
+        val client = InstallReferrerClient.newBuilder(context).build()
         scheduleWatchdog("install referrer cleanup", 30, TimeUnit.SECONDS) {
             runCatchingException { client.endConnection() }
         }
@@ -1426,6 +1507,14 @@ object TrackHub {
     }
 
     private fun appendConsent(prefs: android.content.SharedPreferences, body: JSONObject) {
+        listOf(
+            "openai_ads_measurement_consent" to OPENAI_MEASUREMENT_KEY,
+            "openai_ads_user_data_consent" to OPENAI_USER_DATA_KEY,
+            "openai_ads_personalization_consent" to OPENAI_PERSONALIZATION_KEY,
+        ).forEach { (field, key) ->
+            body.put(field, if (prefs.contains(key)) prefs.getBoolean(key, false) else JSONObject.NULL)
+        }
+        body.put("openai_ads_consent_revision", prefs.getInt(OPENAI_CONSENT_REVISION_KEY, 1).coerceAtLeast(1))
         if (prefs.contains(AD_USER_DATA_KEY)) body.put("ad_user_data", prefs.getBoolean(AD_USER_DATA_KEY, false))
         if (prefs.contains(AD_PERSONALIZATION_KEY)) body.put("ad_personalization", prefs.getBoolean(AD_PERSONALIZATION_KEY, false))
         if (prefs.contains(EEA_KEY)) body.put("eea", prefs.getBoolean(EEA_KEY, false))
@@ -1504,6 +1593,7 @@ object TrackHub {
             .put("platform", "android")
             .put("sdk_name", "trackhub-android")
             .put("sdk_version", SDK_VERSION)
+        firebaseAppInstanceId?.let { body.put("app_instance_id", it) }
         appendAdvertisingId(context, prefs, body)
         appendConsent(prefs, body)
         sendOrQueue("install", body.toString())
@@ -1600,7 +1690,7 @@ object TrackHub {
     }
 
     private fun parseAttribution(raw: String): TrackHubAttribution? = runCatchingException {
-        val envelope = JSONObject(raw)
+        val envelope = boundedJsonObject(raw)
         if (!envelope.optBoolean("ok")) return@runCatchingException null
         val attribution = envelope.optJSONObject("attribution") ?: return@runCatchingException null
         if (attribution.optString("provider") != "custom") return@runCatchingException null
@@ -1632,7 +1722,7 @@ object TrackHub {
     private fun syncPersistedExternalIdentities(context: Context) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val desired = runCatchingException {
-            JSONObject(prefs.getString(EXTERNAL_IDENTITIES_KEY, "{}") ?: "{}")
+            boundedJsonObject(prefs.getString(EXTERNAL_IDENTITIES_KEY, "{}") ?: "{}")
         }.getOrDefault(JSONObject())
         val providers = desired.keys()
         while (providers.hasNext()) {
@@ -1656,7 +1746,7 @@ object TrackHub {
         }
         val fingerprint = externalIdentityFingerprint(provider, userId)
         val acknowledged = runCatchingException {
-            JSONObject(prefs.getString(EXTERNAL_IDENTITY_ACK_KEY, "{}") ?: "{}")
+            boundedJsonObject(prefs.getString(EXTERNAL_IDENTITY_ACK_KEY, "{}") ?: "{}")
         }.getOrDefault(JSONObject())
         if (acknowledged.optString(provider) == fingerprint) return
         val body = JSONObject()
@@ -1726,7 +1816,7 @@ object TrackHub {
                     return@state
                 }
                 val path = runCatchingException {
-                    JSONObject(raw).optString("deep_link_path").takeIf { it.isNotEmpty() }
+                    boundedJsonObject(raw).optString("deep_link_path").takeIf { it.isNotEmpty() }
                 }.getOrNull()
                 prefs.edit().putBoolean(key, true).remove(DEFERRED_MATCH_TOKEN_KEY).apply()
                 runHostCallbackOnMain { handler(path) }
@@ -1908,14 +1998,13 @@ object TrackHub {
     }
 
     /**
-     * Preserve FIFO except when repairing the SDK 3.0.0 queue ordering bug:
-     * the server cannot accept an external identity before its production
-     * install, so let that one-shot anchor pass a blocked identity head.
+     * The installation anchors attribution for every subsequent event. It
+     * must pass events persisted while waiting for remote config/referrer,
+     * including queues restored after an offline launch or process restart.
      */
     internal fun preferredPendingDeliveryIndex(kinds: List<String?>): Int {
         if (kinds.isEmpty()) return -1
-        if (kinds.first() != "external_identity") return 0
-        val installIndex = kinds.indexOfFirst { it == "production_install" }
+        val installIndex = kinds.indexOfFirst { it == "production_install" || it == "test_install" }
         return if (installIndex >= 0) installIndex else 0
     }
 
@@ -1937,8 +2026,8 @@ object TrackHub {
             val legacyBackup = File(legacyFile.path + ".bak")
             if (legacyFile.exists() || legacyBackup.exists()) {
                 val migrated = runCatchingException {
-                    AtomicFile(legacyFile).openRead().bufferedReader(Charsets.UTF_8).use { reader ->
-                        decodePending(reader.readText())
+                    AtomicFile(legacyFile).openRead().use { input ->
+                        input.readBoundedUtf8(MAX_PENDING_BYTES * 2)?.let(::decodePending)
                     }
                 }.getOrNull()
                 if (migrated != null && persistPending(context, queueKey, migrated)) {
@@ -1973,17 +2062,7 @@ object TrackHub {
 
         val atomic = AtomicFile(file)
         val raw = runCatchingException {
-            atomic.openRead().use { input ->
-                val output = ByteArrayOutputStream()
-                val buffer = ByteArray(8192)
-                while (output.size() <= MAX_PENDING_BYTES * 2) {
-                    val read = input.read(buffer)
-                    if (read <= 0) break
-                    output.write(buffer, 0, read)
-                }
-                if (output.size() > MAX_PENDING_BYTES * 2) null
-                else output.toString(Charsets.UTF_8.name())
-            }
+            atomic.openRead().use { it.readBoundedUtf8(MAX_PENDING_BYTES * 2) }
         }.getOrNull()
         val decoded = raw?.let(::decodePending)
         if (decoded != null) return decoded
@@ -2015,8 +2094,8 @@ object TrackHub {
         if (candidateBases.isEmpty()) return
 
         fun readQueue(file: File): JSONArray? = runCatchingException {
-            AtomicFile(file).openRead().bufferedReader(Charsets.UTF_8).use { reader ->
-                decodePending(reader.readText())
+            AtomicFile(file).openRead().use { input ->
+                input.readBoundedUtf8(MAX_PENDING_BYTES * 2)?.let(::decodePending)
             }
         }.getOrNull()
 
@@ -2033,6 +2112,12 @@ object TrackHub {
                 val id = item.optString("id")
                 if (id.isEmpty() || ids.add(id)) merged.put(item)
             }
+            // Bound memory across many rotated namespaces, not only at the end.
+            trimPending(merged)
+            ids.clear()
+            for (index in 0 until merged.length()) {
+                merged.optJSONObject(index)?.optString("id")?.takeIf { it.isNotEmpty() }?.let(ids::add)
+            }
             migrated += candidate
         }
         if (migrated.isEmpty()) return
@@ -2046,7 +2131,8 @@ object TrackHub {
     }
 
     private fun decodePending(raw: String): JSONArray? {
-        if (raw.toByteArray(Charsets.UTF_8).size > MAX_PENDING_BYTES * 2) return null
+        if (!hasBoundedJsonStructure(raw, MAX_PENDING_BYTES * 2)
+            || raw.toByteArray(Charsets.UTF_8).size > MAX_PENDING_BYTES * 2) return null
         return runCatchingException { JSONArray(raw) }.getOrNull()
     }
 
@@ -2088,7 +2174,7 @@ object TrackHub {
 
     // On `io`. Exactly one network request is in flight process-wide.
     private fun scheduleNextDelivery(context: Context) {
-        if (trackingDisabled || runtimeCircuitOpen.get() || deliveryInFlight) return
+        if (trackingDisabled || runtimeCircuitOpen.get() || deliveryInFlight || initialInstallPending) return
         val queueKey = pendingReportsKey()
         val items = loadPending(context, queueKey)
         while (items.length() > 0) {
@@ -2234,14 +2320,14 @@ object TrackHub {
                 "test_install" -> log("integration-test install reported")
                 "external_identity" -> {
                     runCatchingException {
-                        val body = JSONObject(pending.body)
+                        val body = boundedJsonObject(pending.body)
                         val provider = body.getString("provider")
                         val externalId = if (body.isNull("external_user_id")) {
                             null
                         } else {
                             body.getString("external_user_id")
                         }
-                        val acknowledged = JSONObject(
+                        val acknowledged = boundedJsonObject(
                             prefs.getString(EXTERNAL_IDENTITY_ACK_KEY, "{}") ?: "{}",
                         )
                         acknowledged.put(
@@ -2339,7 +2425,7 @@ object TrackHub {
 
     private fun withIntegrationTestToken(rawBody: String): String {
         val token = integrationTestToken ?: return rawBody
-        return runCatchingException { JSONObject(rawBody).put("test_run_token", token).toString() }
+        return runCatchingException { boundedJsonObject(rawBody).put("test_run_token", token).toString() }
             .getOrDefault(rawBody)
     }
 
@@ -2419,16 +2505,18 @@ object TrackHub {
             val output = ByteArrayOutputStream()
             val buffer = ByteArray(4096)
             val deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(MAX_RESPONSE_READ_MS)
-            while (output.size() < MAX_RESPONSE_BYTES) {
+            while (output.size() <= MAX_RESPONSE_BYTES) {
                 val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime())
-                if (remainingMs <= 0) break
+                if (remainingMs <= 0) return@use null
                 conn.readTimeout = min(10_000L, remainingMs).coerceAtLeast(1L).toInt()
-                val remaining = MAX_RESPONSE_BYTES - output.size()
+                val remaining = MAX_RESPONSE_BYTES + 1 - output.size()
                 val read = input.read(buffer, 0, min(buffer.size, remaining))
-                if (read <= 0) break
+                if (read < 0) break
+                if (read == 0) return@use null
                 output.write(buffer, 0, read)
             }
-            output.toString(Charsets.UTF_8.name())
+            if (output.size() > MAX_RESPONSE_BYTES) return@use null
+            output.toString(Charsets.UTF_8.name()).takeIf { hasBoundedJsonStructure(it, MAX_RESPONSE_BYTES) }
         }
     }
 
@@ -2447,7 +2535,7 @@ object TrackHub {
     }.getOrNull()
 
     private fun serverClockOffset(raw: String?, localTimeMs: Long): Long? = runCatchingException {
-        val json = JSONObject(raw ?: return@runCatchingException null)
+        val json = boundedJsonObject(raw ?: return@runCatchingException null)
         val serverTime = json.optLong("server_time_ms", 0L)
         val error = json.optString("error")
         serverClockOffset(error, serverTime, localTimeMs)
@@ -2602,7 +2690,7 @@ object TrackHub {
 
     private fun saveInstallCredential(context: Context, responseBody: String?) {
         val token = ingestToken ?: return
-        val json = runCatchingException { JSONObject(responseBody ?: return) }.getOrNull() ?: return
+        val json = runCatchingException { boundedJsonObject(responseBody ?: return) }.getOrNull() ?: return
         val credential = json.optString("install_token")
         val responseInstallUid = json.optString("install_uid")
         if (responseInstallUid != installUid(context)) return
@@ -2696,7 +2784,7 @@ object TrackHub {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val raw = prefs.getString(RUNTIME_CIRCUIT_MARKER_KEY, null) ?: return
         val marker = try {
-            JSONObject(raw)
+            boundedJsonObject(raw)
         } catch (_: Exception) {
             prefs.edit().remove(RUNTIME_CIRCUIT_MARKER_KEY).apply()
             return

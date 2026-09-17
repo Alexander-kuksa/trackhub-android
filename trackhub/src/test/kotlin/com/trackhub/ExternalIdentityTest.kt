@@ -39,7 +39,7 @@ class ExternalIdentityTest {
             ),
         )
         assertEquals(
-            0,
+            1,
             TrackHub.preferredPendingDeliveryIndex(
                 listOf("event", "production_install"),
             ),
