@@ -1,9 +1,15 @@
 # TrackHub Android 3.0 integration reference
 
-## Android 3.0.8
+## Android 3.0.9
+
+Includes first-install delivery ordering, durable late Firebase identity updates,
+shared Install Referrer readiness, and bounded payload/storage crash containment.
+Subsequent events wait in the durable queue until the initial install is queued;
+network retries preserve the original first-open timestamp.
+
 
 Adds independent OpenAI destination consent. With JitPack in your repositories,
-use `com.github.Alexander-kuksa:trackhub-android:3.0.8`. Configure
+use `com.github.Alexander-kuksa:trackhub-android:3.0.9`. Configure
 `TrackHubConfig.openAiAdsConsent` with actual host/CMP decisions:
 
 ```kotlin
@@ -36,9 +42,9 @@ the provider event window); a warm app link cannot manufacture an installation.
 Test a real Play install and CMP withdrawal. Build success or API acceptance is
 not proof of attribution in Ads reporting. Never put a CAPI key in the app.
 
-## APIs introduced in Android 3.0.7 (included in 3.0.8)
+## APIs introduced in Android 3.0.7 (included in 3.0.9)
 
-These shared APIs are also available on iOS. Keep the current `3.0.8`
+These shared APIs are also available on iOS. Keep the current `3.0.9`
 dependency from the installation instructions above; this section documents
 when the APIs were introduced, not a separate version to install.
 
