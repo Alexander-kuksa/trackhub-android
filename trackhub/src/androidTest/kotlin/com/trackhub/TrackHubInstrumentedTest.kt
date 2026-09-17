@@ -272,6 +272,7 @@ class TrackHubInstrumentedTest {
             assertEquals("onboarding_placement", salesRequests["pw_shown"]!!.getJSONObject("callback_params").getString("placement_name"))
             assertEquals("inapp_placement", salesRequests["purchase_cta_tapped"]!!.getJSONObject("callback_params").getString("placement_name"))
             waitUntil("sales events acknowledged") { TrackHub.offlineQueueCount(context, testToken) == 0 }
+            productionEventsWaitForInstallAndFirebaseBackfills(context)
 
             // A recoverable signing-clock response must retry before notifying
             // the host. Only the final rejection stops delivery, once, on main.
@@ -360,6 +361,7 @@ class TrackHubInstrumentedTest {
                 TrackHub.offlineQueuePathCount(context, outageToken, "sdk/track") == 0 &&
                     !prefs.contains("openai_oppref") &&
                     !prefs.contains("pending_openai_oppref") &&
+                    !prefs.contains("firebase_app_instance_id") &&
                     !prefs.contains("first_open_at_ms")
             }
             assertFalse(
@@ -396,6 +398,74 @@ class TrackHubInstrumentedTest {
             TrackHub.resetRuntimeCircuitForTest()
             TrackHub.clearOfflineQueueForTest(context, testToken)
             prefs.edit().clear().commit()
+            server.shutdown()
+        }
+    }
+
+    private fun productionEventsWaitForInstallAndFirebaseBackfills(context: Context) {
+        val prefs = context.getSharedPreferences("trackhub", Context.MODE_PRIVATE)
+        prefs.edit().clear().commit()
+        TrackHub.resetVolatileInstallUidForTest()
+        TrackHub.resetVolatileFirstOpenAtForTest()
+        val configSeen = CountDownLatch(1)
+        val releaseConfig = CountDownLatch(1)
+        val eventSeen = CountDownLatch(1)
+        val firebaseSeen = CountDownLatch(1)
+        val posts = java.util.Collections.synchronizedList(mutableListOf<Pair<String, JSONObject>>())
+        val installAttempts = AtomicInteger(0)
+        val productionToken = "production-attribution-test-token-123456"
+        val server = MockWebServer()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                if (request.path?.endsWith("/sdk/config") == true) {
+                    configSeen.countDown()
+                    releaseConfig.await(10, TimeUnit.SECONDS)
+                    return MockResponse().setBody("{\"androidAdvertisingIdCollectionEnabled\":false}")
+                }
+                if (request.method == "POST") {
+                    val body = JSONObject(request.body.clone().readUtf8())
+                    posts.add(request.path.orEmpty() to body)
+                    assertFalse(body.has("test_run_token"))
+                    if (request.path?.endsWith("/install") == true) {
+                        if (installAttempts.incrementAndGet() == 1) return MockResponse().setResponseCode(503)
+                        if (body.optString("app_instance_id") == "firebase-late-id") firebaseSeen.countDown()
+                    }
+                    if (request.path?.endsWith("/sdk/track") == true) eventSeen.countDown()
+                }
+                return MockResponse().setBody("{}")
+            }
+        }
+        server.start()
+        try {
+            val key = sdkKey(server.url("/").toString().trimEnd('/'), productionToken, "production-test-secret")
+            TrackHub.start(context, TrackHubConfig(sdkKey = key))
+            TrackHub.trackEvent("pw_shown", deduplicationId = "first-paywall")
+            assertTrue(configSeen.await(10, TimeUnit.SECONDS))
+            assertTrue(TrackHub.awaitStateIdleForTest(5_000))
+            assertTrue("an event overtook the pending first install", posts.isEmpty())
+            releaseConfig.countDown()
+            assertTrue("production event did not recover after install retry", eventSeen.await(30, TimeUnit.SECONDS))
+            val captured = synchronized(posts) { posts.toList() }
+            assertTrue(captured[0].first.endsWith("/install"))
+            assertTrue(captured[1].first.endsWith("/install"))
+            val first = captured[0].second
+            assertEquals(first.toString(), captured[1].second.toString())
+            val event = captured.first { it.first.endsWith("/sdk/track") }.second
+            assertEquals(first.getString("install_uid"), event.getString("install_uid"))
+            assertEquals(first.getString("occurred_at"), event.getString("first_open_at"))
+            assertTrue(prefs.getBoolean("install_sent", false))
+
+            TrackHub.updateFirebaseAppInstanceId("firebase-late-id")
+            assertTrue("late Firebase ID never reached install context", firebaseSeen.await(10, TimeUnit.SECONDS))
+            assertEquals("firebase-late-id", prefs.getString("firebase_app_instance_id", null))
+            waitUntil("production queue drained") {
+                TrackHub.offlineQueuePathCount(context, null, "install") == 0 &&
+                    TrackHub.offlineQueuePathCount(context, null, "sdk/session") == 0 &&
+                    TrackHub.offlineQueuePathCount(context, null, "sdk/track") == 0
+            }
+        } finally {
+            releaseConfig.countDown()
+            TrackHub.clearOfflineQueueForTest(context, null)
             server.shutdown()
         }
     }

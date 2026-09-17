@@ -100,6 +100,7 @@ object TrackHub {
     private const val PREFS = "trackhub"
     private const val INSTALL_SENT_KEY = "install_sent"
     private const val FIRST_OPEN_AT_KEY = "first_open_at_ms"
+    private const val FIREBASE_APP_INSTANCE_ID_KEY = "firebase_app_instance_id"
     private const val PENDING_REPORTS_KEY = "pending_reports"
     private const val SESSION_SEQ_KEY = "session_seq"
     private const val LAST_BACKGROUND_KEY = "last_background_ms"
@@ -212,6 +213,7 @@ object TrackHub {
     @Volatile private var pendingErasureCompletion: ((Boolean) -> Unit)? = null
     // Accessed only from `io`.
     private var deliveryInFlight = false
+    private var initialInstallPending = false
     private var retryGeneration = 0L
     private var retryScheduledAtMs = 0L
     private var transientRetryNotBeforeMs = 0L
@@ -324,8 +326,10 @@ object TrackHub {
         }
         privacyStopRequested.set(false)
         trackingDisabled = false
-        this.firebaseAppInstanceId = configuration.firebaseAppInstanceId?.takeIf { it.isNotBlank() }
+        this.firebaseAppInstanceId = normalizedFirebaseAppInstanceId(configuration.firebaseAppInstanceId)
+            ?: prefs.getString(FIREBASE_APP_INSTANCE_ID_KEY, null)
         val prefsEdit = prefs.edit()
+        this.firebaseAppInstanceId?.let { prefsEdit.putString(FIREBASE_APP_INSTANCE_ID_KEY, it) }
         normalizedCountryCode(configuration.countryCode)?.let { prefsEdit.putString(COUNTRY_CODE_KEY, it) }
         applyGoogleAdsConsent(prefsEdit, configuration.googleAdsConsent)
         applyPiplConsent(prefsEdit, configuration.piplConsent)
@@ -384,10 +388,23 @@ object TrackHub {
      */
     @JvmStatic
     fun updateFirebaseAppInstanceId(appInstanceId: String) {
-        if (!privacyStopRequested.get() && !runtimeCircuitOpen.get() && appInstanceId.isNotEmpty()) {
-            firebaseAppInstanceId = appInstanceId
+        val value = normalizedFirebaseAppInstanceId(appInstanceId) ?: return
+        if (privacyStopRequested.get() || runtimeCircuitOpen.get()) return
+        io.execute {
+            if (trackingDisabled || privacyStopRequested.get() || runtimeCircuitOpen.get()) return@execute
+            val context = appContext ?: return@execute
+            val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            if (firebaseAppInstanceId == value && prefs.getString(FIREBASE_APP_INSTANCE_ID_KEY, null) == value) return@execute
+            firebaseAppInstanceId = value
+            prefs.edit().putString(FIREBASE_APP_INSTANCE_ID_KEY, value).apply()
+            if (integrationTestToken == null && prefs.getBoolean(INSTALL_SENT_KEY, false)) {
+                sendConsentUpdate(context)
+            }
         }
     }
+
+    internal fun normalizedFirebaseAppInstanceId(value: String?): String? =
+        value?.trim()?.takeIf { it.length in 1..64 }
 
     /**
      * Bind or clear an optional billing identity without importing that
@@ -1059,6 +1076,7 @@ object TrackHub {
             .remove(PENDING_OPENAI_OPPREF_KEY)
             .remove(DEFERRED_MATCH_TOKEN_KEY)
             .remove(FIRST_OPEN_AT_KEY)
+            .remove(FIREBASE_APP_INSTANCE_ID_KEY)
             .remove(SESSION_SEQ_KEY)
             .remove(LAST_BACKGROUND_KEY)
             .remove(COUNTRY_CODE_KEY)
@@ -1336,6 +1354,10 @@ object TrackHub {
 
     private fun reportInstallIfNeeded(context: Context): Boolean {
         if (trackingDisabled || runtimeCircuitOpen.get()) return false
+        // Attribution lookup and lifecycle callbacks may request bootstrap
+        // during start. Share the outstanding gate instead of opening another
+        // Play connection and dispatching a second delayed install callback.
+        if (initialInstallPending) return true
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val installUid = installUid(context)
         val installAlreadySent = prefs.getBoolean(INSTALL_SENT_KEY, false)
@@ -1352,9 +1374,12 @@ object TrackHub {
             return false
         }
 
-        val client = InstallReferrerClient.newBuilder(context).build()
+        initialInstallPending = true
         val readiness = InitialInstallReadinessGate(
-            onInitialReady = { referrer -> io.execute { sendInstall(context, prefs, referrer) } },
+            onInitialReady = { referrer -> io.execute {
+                initialInstallPending = false
+                sendInstall(context, prefs, referrer)
+            } },
             onLateReferrer = { referrer ->
                 // The bounded fallback may have fired first. Preserve a late
                 // Play response as an idempotent attribution signal for the
@@ -1379,6 +1404,7 @@ object TrackHub {
             TimeUnit.SECONDS,
             readiness::onTimeout,
         )
+        val client = InstallReferrerClient.newBuilder(context).build()
         scheduleWatchdog("install referrer cleanup", 30, TimeUnit.SECONDS) {
             runCatchingException { client.endConnection() }
         }
@@ -1567,6 +1593,7 @@ object TrackHub {
             .put("platform", "android")
             .put("sdk_name", "trackhub-android")
             .put("sdk_version", SDK_VERSION)
+        firebaseAppInstanceId?.let { body.put("app_instance_id", it) }
         appendAdvertisingId(context, prefs, body)
         appendConsent(prefs, body)
         sendOrQueue("install", body.toString())
@@ -1971,14 +1998,13 @@ object TrackHub {
     }
 
     /**
-     * Preserve FIFO except when repairing the SDK 3.0.0 queue ordering bug:
-     * the server cannot accept an external identity before its production
-     * install, so let that one-shot anchor pass a blocked identity head.
+     * The installation anchors attribution for every subsequent event. It
+     * must pass events persisted while waiting for remote config/referrer,
+     * including queues restored after an offline launch or process restart.
      */
     internal fun preferredPendingDeliveryIndex(kinds: List<String?>): Int {
         if (kinds.isEmpty()) return -1
-        if (kinds.first() != "external_identity") return 0
-        val installIndex = kinds.indexOfFirst { it == "production_install" }
+        val installIndex = kinds.indexOfFirst { it == "production_install" || it == "test_install" }
         return if (installIndex >= 0) installIndex else 0
     }
 
@@ -2148,7 +2174,7 @@ object TrackHub {
 
     // On `io`. Exactly one network request is in flight process-wide.
     private fun scheduleNextDelivery(context: Context) {
-        if (trackingDisabled || runtimeCircuitOpen.get() || deliveryInFlight) return
+        if (trackingDisabled || runtimeCircuitOpen.get() || deliveryInFlight || initialInstallPending) return
         val queueKey = pendingReportsKey()
         val items = loadPending(context, queueKey)
         while (items.length() > 0) {
